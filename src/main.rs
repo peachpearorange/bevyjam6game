@@ -3,9 +3,13 @@
 
 use bevy::asset::AssetMetaCheck;
 use bevy::prelude::*;
+// use bevy::math::Affine2; // Not needed with voxel world
+use bevy::input::mouse::MouseMotion;
 use avian3d::prelude::*;
+// use avian3d::collision::AsyncCollider; // Not available in this version
 use bevy_embedded_assets::EmbeddedAssetPlugin;
 use enum_assoc::Assoc;
+use bevy_voxel_world::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Assoc)]
 #[func(const fn texture_coords(self) -> u32)]
@@ -13,28 +17,36 @@ enum BlockType {
     #[assoc(texture_coords = 0)]
     Grass,
     #[assoc(texture_coords = 1)]
-    GrayBricks,
+    Road,
     #[assoc(texture_coords = 2)]
-    Pavement,
+    Sidewalk,
     #[assoc(texture_coords = 3)]
-    Window,
+    Building,
     #[assoc(texture_coords = 4)]
+    Window,
+    #[assoc(texture_coords = 5)]
+    Door,
+    #[assoc(texture_coords = 6)]
+    Roof,
+    #[assoc(texture_coords = 7)]
     RedBricks,
+    #[assoc(texture_coords = 8)]
+    GrayBricks,
 }
 
 impl BlockType {
-    const TEXTURE_SIZE: f32 = 16.0;
+    const TEXTURE_SIZE: u32 = 16;
+    const SIDE_LENGTH_PIXELS: u32 = 10;
     
     fn get_texture_atlas_index(self) -> usize {
-        let (x, y) = self.texture_coords();
-        (y * 4 + x) as usize
+        self.texture_coords() as usize
     }
 }
 
-const CITY_SIZE: i32 = 50;
+const CITY_SIZE: i32 = 100;
 const BLOCK_SIZE: f32 = 1.0;
-const BUILDING_HEIGHT_MIN: i32 = 3;
-const BUILDING_HEIGHT_MAX: i32 = 8;
+const BUILDING_HEIGHT_MIN: i32 = 15;
+const BUILDING_HEIGHT_MAX: i32 = 25;
 
 #[derive(Component)]
 struct Player;
@@ -51,15 +63,51 @@ struct CityBlock {
 #[derive(Component)]
 struct Billboard;
 
+#[derive(Component)]
+struct Tree;
+
+#[derive(Component)]
+enum FacingMode {
+    PositionIgnoreY,
+    Position,
+    Direction,
+}
+
+#[derive(Resource, Clone, Default)]
+struct MyWorld;
+
+impl VoxelWorldConfig for MyWorld {
+    type MaterialIndex = u8;
+    type ChunkUserBundle = (RigidBody, Collider);
+
+    fn spawning_distance(&self) -> u32 {
+        50
+    }
+
+    fn texture_index_mapper(&self) -> std::sync::Arc<dyn Fn(u8) -> [u32; 3] + Send + Sync> {
+        std::sync::Arc::new(|material_index: u8| {
+            // Return [top, sides, bottom] texture indices
+            // For our game, we'll use the same texture for all faces
+            [material_index as u32, material_index as u32, material_index as u32]
+        })
+    }
+
+    fn voxel_texture(&self) -> Option<(String, u32)> {
+        // blocks.png texture with 10 different textures stacked vertically
+        Some(("blocks.png".into(), 10))
+    }
+}
+
 #[derive(Resource)]
 struct GameAssets {
-    blocks_texture: Handle<Image>,
     player_texture: Handle<Image>,
     pizza_texture: Handle<Image>,
+    tree_texture: Handle<Image>,
     blocks_layout: Handle<TextureAtlasLayout>,
     block_material: Handle<StandardMaterial>,
     player_material: Handle<StandardMaterial>,
     pizza_material: Handle<StandardMaterial>,
+    tree_material: Handle<StandardMaterial>,
     quad_mesh: Handle<Mesh>,
 }
 
@@ -82,22 +130,27 @@ fn main() {
         .add_plugins(DefaultPlugins.set(AssetPlugin {
             meta_check: AssetMetaCheck::Never,
             ..default()
-        }))
+        }).set(ImagePlugin::default_nearest()))
         .add_plugins(EmbeddedAssetPlugin::default())
         .add_plugins(PhysicsPlugins::default())
+        .add_plugins(VoxelWorldPlugin::with_config(MyWorld))
         .insert_resource(PlayerStats {
             pizzas_delivered: 0,
             pizzas_remaining: 10,
         })
-        .add_systems(Startup, (setup_assets, setup_camera, generate_city, spawn_player).chain())
+        .add_systems(Startup, (setup_assets, setup_camera, setup_voxel_world, generate_city, spawn_player).chain())
         .add_systems(Update, (
             player_movement,
             player_jump,
             throw_pizza,
             pizza_physics,
             camera_follow_player,
-            billboard_system,
+            face_camera_system,
             camera_controller,
+            mouse_look,
+        ))
+        .add_systems(Update, (
+            add_colliders_to_chunks,
             update_ui,
         ))
         .run();
@@ -110,24 +163,16 @@ fn setup_assets(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let blocks_texture = asset_server.load("blocks.png");
+    // Don't load blocks_texture here since voxel world handles it
     let player_texture = asset_server.load("guy.png");
     let pizza_texture = asset_server.load("pizzabox.png");
+    let tree_texture = asset_server.load("tree.png");
     
-    let layout = TextureAtlasLayout::from_grid(
-        UVec2::splat(BlockType::TEXTURE_SIZE as u32),
-        4,
-        2,
-        None,
-        None,
-    );
-    let blocks_layout = texture_atlas_layouts.add(layout);
+    // Remove texture atlas layout since voxel world handles textures
+    let blocks_layout = texture_atlas_layouts.add(TextureAtlasLayout::new_empty(UVec2::splat(10)));
     
-    let block_material = materials.add(StandardMaterial {
-        base_color_texture: Some(blocks_texture.clone()),
-        unlit: false,
-        ..default()
-    });
+    // Remove block_material since voxel world handles its own materials
+    let block_material = materials.add(StandardMaterial::default());
     
     let player_material = materials.add(StandardMaterial {
         base_color_texture: Some(player_texture.clone()),
@@ -143,16 +188,25 @@ fn setup_assets(
         ..default()
     });
     
+    let tree_material = materials.add(StandardMaterial {
+        base_color_texture: Some(tree_texture.clone()),
+        alpha_mode: AlphaMode::Blend,
+        unlit: false,
+        ..default()
+    });
+    
     let quad_mesh = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
+    // Voxel materials are handled by the voxel world system
     
     commands.insert_resource(GameAssets {
-        blocks_texture,
         player_texture,
         pizza_texture,
+        tree_texture,
         blocks_layout,
         block_material,
         player_material,
         pizza_material,
+        tree_material,
         quad_mesh,
     });
 }
@@ -161,6 +215,7 @@ fn setup_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(25.0, 15.0, 25.0).looking_at(Vec3::ZERO, Vec3::Y),
+        VoxelWorldCamera::<MyWorld>::default(),
         CameraController {
             target: Vec3::ZERO,
             distance: 30.0,
@@ -179,7 +234,11 @@ fn setup_camera(mut commands: Commands) {
     ));
 }
 
-fn generate_city(mut commands: Commands, assets: Res<GameAssets>) {
+fn setup_voxel_world() {
+    // Voxel world is automatically set up by the plugin
+}
+
+fn generate_city(mut voxel_world: VoxelWorld<MyWorld>, mut commands: Commands, assets: Res<GameAssets>) {
     use std::collections::HashMap;
     
     let mut noise_seed = 12345u32;
@@ -188,42 +247,71 @@ fn generate_city(mut commands: Commands, assets: Res<GameAssets>) {
         noise_seed
     };
     
-    let mut _height_map = HashMap::new();
+    let mut occupied = HashMap::new();
+    let block_size = 20; // Size of each city block (building + space)
     
+    // First pass: generate roads and sidewalks
     for x in -CITY_SIZE..CITY_SIZE {
-
-
         for z in -CITY_SIZE..CITY_SIZE {
-            let distance_from_center = ((x * x + z * z) as f32).sqrt();
-            let is_road = (x % 8 == 0) || (z % 8 == 0);
+            let is_road = (x % block_size == 0) || (z % block_size == 0);
             
             if is_road {
-                spawn_block(&mut commands, &assets, IVec3::new(x, 0, z), BlockType::Road);
+                voxel_world.set_voxel(IVec3::new(x, 0, z), WorldVoxel::Solid(BlockType::Road.texture_coords() as u8));
                 
-                if (x % 8 == 0 && z % 8 == 0) && distance_from_center < 30.0 {
-                    for y in 1..3 {
-                        spawn_block(&mut commands, &assets, IVec3::new(x, y, z), BlockType::Tree);
+                if (x % block_size == 0 && z % block_size == 0) {
+                    let distance_from_center = ((x * x + z * z) as f32).sqrt();
+                    if distance_from_center < 30.0 {
+                        spawn_tree(&mut commands, &assets, Vec3::new(x as f32, 0.0, z as f32));
                     }
                 }
             } else {
-                spawn_block(&mut commands, &assets, IVec3::new(x, 0, z), BlockType::Sidewalk);
+                voxel_world.set_voxel(IVec3::new(x, 0, z), WorldVoxel::Solid(BlockType::Sidewalk.texture_coords() as u8));
+            }
+        }
+    }
+    
+    // Second pass: generate buildings in plots
+    for block_x in (-CITY_SIZE / block_size)..(CITY_SIZE / block_size) {
+        for block_z in (-CITY_SIZE / block_size)..(CITY_SIZE / block_size) {
+            let center_x = block_x * block_size + block_size / 2;
+            let center_z = block_z * block_size + block_size / 2;
+            let distance_from_center = ((center_x * center_x + center_z * center_z) as f32).sqrt();
+            
+            if distance_from_center < 35.0 && (rng() % 100) < 60 {
+                // Generate a building of random size within the plot
+                let building_width = 3 + (rng() % 8) as i32; // 3-10 blocks wide
+                let building_depth = 3 + (rng() % 8) as i32; // 3-10 blocks deep
+                let building_height = BUILDING_HEIGHT_MIN + 
+                    ((rng() % (BUILDING_HEIGHT_MAX - BUILDING_HEIGHT_MIN) as u32) as i32);
                 
-                if distance_from_center < 35.0 && (rng() % 100) < 40 {
-                    let building_height = BUILDING_HEIGHT_MIN + 
-                        ((rng() % (BUILDING_HEIGHT_MAX - BUILDING_HEIGHT_MIN) as u32) as i32);
-                    _height_map.insert((x, z), building_height);
-                    
-                    for y in 1..=building_height {
-                        let block_type = if y == building_height {
-                            BlockType::Roof
-                        } else if y == 1 && (rng() % 4) == 0 {
-                            BlockType::Door
-                        } else if (rng() % 3) == 0 {
-                            BlockType::Window
-                        } else {
-                            BlockType::Building
-                        };
-                        spawn_block(&mut commands, &assets, IVec3::new(x, y, z), block_type);
+                // Center the building in the plot with some spacing
+                let start_x = center_x - building_width / 2;
+                let start_z = center_z - building_depth / 2;
+                
+                // Ensure building doesn't go into roads (leave 2 block buffer)
+                let min_x = block_x * block_size + 2;
+                let max_x = (block_x + 1) * block_size - 2;
+                let min_z = block_z * block_size + 2;
+                let max_z = (block_z + 1) * block_size - 2;
+                
+                for bx in start_x.max(min_x)..(start_x + building_width).min(max_x) {
+                    for bz in start_z.max(min_z)..(start_z + building_depth).min(max_z) {
+                        if !occupied.contains_key(&(bx, bz)) {
+                            occupied.insert((bx, bz), true);
+                            
+                            for y in 1..=building_height {
+                                let block_type = if y == building_height {
+                                    BlockType::Roof
+                                } else if y == 1 && (bx == start_x || bz == start_z) && (rng() % 6) == 0 {
+                                    BlockType::Door
+                                } else if (rng() % 4) == 0 {
+                                    BlockType::Window
+                                } else {
+                                    BlockType::Building
+                                };
+                                voxel_world.set_voxel(IVec3::new(bx, y, bz), WorldVoxel::Solid(block_type.texture_coords() as u8));
+                            }
+                        }
                     }
                 }
             }
@@ -231,21 +319,23 @@ fn generate_city(mut commands: Commands, assets: Res<GameAssets>) {
     }
 }
 
-fn spawn_block(c: &mut Commands, assets: &GameAssets, position: IVec3, block_type: BlockType) {
+
+fn spawn_tree(c: &mut Commands, assets: &GameAssets, position: Vec3) {
     let world_pos = Vec3::new(
-        position.x as f32 * BLOCK_SIZE,
-        position.y as f32 * BLOCK_SIZE,
-        position.z as f32 * BLOCK_SIZE,
+        position.x * BLOCK_SIZE,
+        1.0,
+        position.z * BLOCK_SIZE,
     );
     
     c.spawn((
         Mesh3d(assets.quad_mesh.clone()),
-        MeshMaterial3d(assets.block_material.clone()),
-        Transform::from_translation(world_pos),
+        MeshMaterial3d(assets.tree_material.clone()),
+        Transform::from_translation(world_pos)
+            .with_scale(Vec3::new(1.5, 2.0, 1.5)),
         RigidBody::Static,
-        Collider::cuboid(BLOCK_SIZE * 0.5, BLOCK_SIZE * 0.5, BLOCK_SIZE * 0.5),
-        CityBlock { block_type, position },
-        Billboard,
+        Collider::cuboid(0.3, 1.0, 0.3),
+        Tree,
+        FacingMode::PositionIgnoreY,
     ));
 }
 
@@ -253,33 +343,47 @@ fn spawn_player(mut c: Commands, assets: Res<GameAssets>) {
     c.spawn((
         Mesh3d(assets.quad_mesh.clone()),
         MeshMaterial3d(assets.player_material.clone()),
-        Transform::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+        Transform::from_translation(Vec3::new(0.0, 6.0, 0.0))
+            .with_scale(Vec3::new(1.0, 2.0, 1.0)),
         RigidBody::Dynamic,
-        Collider::capsule(0.3, 0.8),
+        Collider::capsule(0.4, 1.0),
         LockedAxes::ROTATION_LOCKED,
+        LinearDamping(2.0),
+        AngularDamping(10.0),
+        Friction::new(0.8),
+        Restitution::new(0.1),
         Player,
-        Billboard,
+        FacingMode::PositionIgnoreY,
     ));
 }
 
 fn player_movement(
     mut player_query: Query<&mut LinearVelocity, With<Player>>,
+    camera_query: Query<&Transform, With<Camera3d>>,
     keyboard: Res<ButtonInput<KeyCode>>,
 ) {
-    if let Ok(mut velocity) = player_query.single_mut() {
+    if let (Ok(mut velocity), Ok(camera_transform)) = (player_query.single_mut(), camera_query.single()) {
         let mut direction = Vec3::ZERO;
         
+        // Get camera's forward and right directions (projected onto horizontal plane)
+        let camera_forward = camera_transform.forward().normalize();
+        let camera_right = camera_transform.right().normalize();
+        
+        // Project onto horizontal plane (remove Y component)
+        let forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalize();
+        let right = Vec3::new(camera_right.x, 0.0, camera_right.z).normalize();
+        
         if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
-            direction.z -= 1.0;
+            direction += forward;
         }
         if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
-            direction.z += 1.0;
+            direction -= forward;
         }
         if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
-            direction.x -= 1.0;
+            direction -= right;
         }
         if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
-            direction.x += 1.0;
+            direction += right;
         }
         
         direction = direction.normalize_or_zero();
@@ -337,12 +441,12 @@ fn throw_pizza(
             commands.spawn((
                 Mesh3d(assets.quad_mesh.clone()),
                 MeshMaterial3d(assets.pizza_material.clone()),
-                Transform::from_translation(spawn_pos).with_scale(Vec3::splat(0.5)),
+                Transform::from_translation(spawn_pos).with_scale(Vec3::splat(1.0)),
                 RigidBody::Dynamic,
                 Collider::sphere(0.2),
                 LinearVelocity(throw_direction * 15.0),
                 Pizza,
-                Billboard,
+                FacingMode::PositionIgnoreY,
             ));
             
             stats.pizzas_remaining -= 1;
@@ -367,6 +471,38 @@ fn pizza_physics(
     }
 }
 
+// this is code from another game
+pub fn face_camera_system(
+  camera_q: Query<&Transform, With<Camera3d>>,
+  mut facers_q: Query<(&mut Transform, &GlobalTransform, &FacingMode), Without<Camera3d>>
+) {
+  if let Ok(cam_transform) = camera_q.single() {
+    for (mut transform, global, mode) in &mut facers_q {
+      let billboard_pos = global.translation();
+      let camera_pos = cam_transform.translation;
+      
+      let direction = match mode {
+        FacingMode::PositionIgnoreY => {
+          (camera_pos - billboard_pos).with_y(0.0).normalize()
+        }
+        FacingMode::Position => (camera_pos - billboard_pos).normalize(),
+        FacingMode::Direction => cam_transform.forward().as_vec3()
+      };
+      
+      // Only rotate around Y axis to keep billboards upright
+      let angle = direction.z.atan2(direction.x);
+      let rotation = Quat::from_rotation_y(angle - std::f32::consts::FRAC_PI_2);
+      
+      // Preserve position and scale
+      let old_scale = transform.scale;
+      let old_translation = transform.translation;
+      transform.rotation = rotation;
+      transform.scale = old_scale;
+      transform.translation = old_translation;
+    }
+  }
+}
+
 fn camera_follow_player(
     player_query: Query<&Transform, With<Player>>,
     mut camera_query: Query<&mut CameraController>,
@@ -380,39 +516,50 @@ fn camera_follow_player(
 }
 
 fn camera_controller(
-    mut camera_query: Query<(&mut Transform, &CameraController), With<Camera3d>>,
+    mut camera_query: Query<(&mut Transform, &mut CameraController), With<Camera3d>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
 ) {
-    if let Ok((mut transform, controller)) = camera_query.single_mut() {
-        let mut yaw = controller.yaw;
-        let mut pitch = controller.pitch;
-        let mut distance = controller.distance;
-        
+    if let Ok((mut transform, mut controller)) = camera_query.single_mut() {
         if keyboard.pressed(KeyCode::KeyQ) {
-            yaw -= 2.0 * time.delta_secs();
+            controller.yaw -= 2.0 * time.delta_secs();
         }
         if keyboard.pressed(KeyCode::KeyX) {
-            yaw += 2.0 * time.delta_secs();
+            controller.yaw += 2.0 * time.delta_secs();
         }
         if keyboard.pressed(KeyCode::KeyZ) {
-            pitch = (pitch - 1.0 * time.delta_secs()).clamp(-1.5, 0.0);
+            controller.pitch = (controller.pitch - 1.0 * time.delta_secs()).clamp(-1.5, 0.0);
         }
         if keyboard.pressed(KeyCode::KeyC) {
-            pitch = (pitch + 1.0 * time.delta_secs()).clamp(-1.5, 0.0);
+            controller.pitch = (controller.pitch + 1.0 * time.delta_secs()).clamp(-1.5, 0.0);
         }
         if keyboard.pressed(KeyCode::Equal) {
-            distance = (distance - 10.0 * time.delta_secs()).max(5.0);
+            controller.distance = (controller.distance - 10.0 * time.delta_secs()).max(5.0);
         }
         if keyboard.pressed(KeyCode::Minus) {
-            distance = (distance + 10.0 * time.delta_secs()).min(50.0);
+            controller.distance = (controller.distance + 10.0 * time.delta_secs()).min(50.0);
         }
         
-        let rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
-        let offset = rotation * Vec3::new(0.0, 0.0, distance);
+        let rotation = Quat::from_euler(EulerRot::YXZ, controller.yaw, controller.pitch, 0.0);
+        let offset = rotation * Vec3::new(0.0, 0.0, controller.distance);
         
         transform.translation = controller.target + offset;
         transform.look_at(controller.target, Vec3::Y);
+    }
+}
+
+fn mouse_look(
+    mut camera_query: Query<&mut CameraController>,
+    mut mouse_motion: EventReader<MouseMotion>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+) {
+    if let Ok(mut controller) = camera_query.single_mut() {
+        if mouse_button.pressed(MouseButton::Right) {
+            for event in mouse_motion.read() {
+                controller.yaw -= event.delta.x * 0.003;
+                controller.pitch = (controller.pitch - event.delta.y * 0.003).clamp(-1.5, 0.0);
+            }
+        }
     }
 }
 
@@ -422,9 +569,44 @@ fn billboard_system(
 ) {
     if let Ok(camera_transform) = camera_query.single() {
         for mut transform in billboard_query.iter_mut() {
-            let direction = (camera_transform.translation - transform.translation).normalize();
             let position = transform.translation;
-            transform.look_at(position + direction, Vec3::Y);
+            let camera_pos = camera_transform.translation;
+            
+            // Calculate direction from billboard to camera
+            let direction = (camera_pos - position).normalize();
+            
+            // Create rotation to face camera, constrained to Y axis
+            let angle = direction.z.atan2(direction.x);
+            let rotation = Quat::from_rotation_y(angle - std::f32::consts::FRAC_PI_2);
+            
+            // Apply rotation while preserving position and scale
+            let old_scale = transform.scale;
+            let old_translation = transform.translation;
+            transform.rotation = rotation;
+            transform.scale = old_scale;
+            transform.translation = old_translation;
+        }
+    }
+}
+
+fn add_colliders_to_chunks(
+    mut commands: Commands,
+    mesh_query: Query<(Entity, &Mesh3d), Without<Collider>>,
+    meshes: Res<Assets<Mesh>>,
+) {
+    for (entity, mesh3d) in mesh_query.iter() {
+        if let Some(mesh) = meshes.get(&mesh3d.0) {
+            // Check if mesh has vertices before creating trimesh collider
+            if let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+                if !positions.is_empty() {
+                    if let Some(collider) = Collider::trimesh_from_mesh(mesh) {
+                        commands.entity(entity).insert((
+                            RigidBody::Static,
+                            collider,
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -470,7 +652,7 @@ fn update_ui(
         ));
         
         parent.spawn((
-            Text::new("Controls: WASD = Move, Space = Jump, E = Throw Pizza, QX = Rotate Camera, ZC = Pitch, +- = Zoom"),
+            Text::new("Controls: WASD = Move, Space = Jump, E = Throw Pizza, Right Click + Mouse = Look, QX = Rotate, ZC = Pitch, +- = Zoom"),
             TextFont {
                 font_size: 16.0,
                 ..default()
