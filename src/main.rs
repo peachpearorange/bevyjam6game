@@ -1,7 +1,7 @@
 #![feature(let_chains)]
 #![allow(dead_code)]
 
-use bevy::{asset::AssetMetaCheck, prelude::*};
+use bevy::{asset::AssetMetaCheck, math::VectorSpace, prelude::*};
 // use bevy::math::Affine2; // Not needed with voxel world
 use {avian3d::prelude::*, bevy::input::mouse::MouseMotion};
 // use avian3d::collision::AsyncCollider; // Not available in this version
@@ -337,7 +337,6 @@ fn spawn_tree(c: &mut Commands, assets: &GameAssets, position: Vec3) {
       Mesh3d(assets.quad_mesh.clone()),
       MeshMaterial3d(assets.tree_material.clone()),
       Transform::from_translation(Vec3::ZERO).with_scale(Vec3::new(1.5, 2.0, 1.5)),
-      LockedAxes::TRANSLATION_LOCKED,
       FacingMode::PositionIgnoreY
     ))
     .id();
@@ -368,7 +367,6 @@ fn spawn_player(mut c: Commands, assets: Res<GameAssets>) {
       Mesh3d(assets.quad_mesh.clone()),
       MeshMaterial3d(assets.player_material.clone()),
       Transform::from_translation(Vec3::ZERO).with_scale(Vec3::new(1.0, 2.0, 1.0)),
-      LockedAxes::TRANSLATION_LOCKED,
       FacingMode::PositionIgnoreY
     ))
     .id();
@@ -490,7 +488,6 @@ fn throw_pizza(
           Mesh3d(assets.quad_mesh.clone()),
           MeshMaterial3d(assets.pizza_material.clone()),
           Transform::from_translation(Vec3::ZERO).with_scale(Vec3::splat(1.0)),
-          LockedAxes::TRANSLATION_LOCKED,
           FacingMode::PositionIgnoreY
         ))
         .id();
@@ -535,18 +532,21 @@ pub fn face_camera_system(
         FacingMode::Position => (camera_pos - billboard_pos).normalize(),
         FacingMode::Direction => cam_transform.forward().as_vec3()
       };
-      transform.look_to(direction, Vec3::Y);
 
-      // Only rotate around Y axis to keep billboards upright
-      // let angle = direction.z.atan2(direction.x);
-      // let rotation = Quat::from_rotation_y(angle - std::f32::consts::FRAC_PI_2);
+      // Preserve scale and translation
+      let old_scale = transform.scale;
+      let old_translation = transform.translation;
 
-      // // Preserve position and scale
-      // let old_scale = transform.scale;
-      // let old_translation = transform.translation;
-      // transform.rotation = rotation;
-      // transform.scale = old_scale;
-      // transform.translation = old_translation;
+      // Calculate rotation to face camera
+      // Invert the angle to fix opposite rotation direction, then add 90 degrees counter-clockwise
+      let angle = -direction.z.atan2(direction.x) + std::f32::consts::FRAC_PI_2;
+      // Rotate around Y axis and then tilt to face camera (positive X rotation to face forward)
+      let rotation = Quat::from_rotation_y(angle) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+
+      // Apply only rotation, preserve position and scale
+      transform.rotation = rotation;
+      transform.scale = old_scale;
+      transform.translation = old_translation;
     }
   }
 }
