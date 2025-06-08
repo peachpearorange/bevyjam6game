@@ -1,9 +1,11 @@
 #![feature(let_chains)]
 #![allow(dead_code)]
 
-use bevy::{asset::AssetMetaCheck, math::VectorSpace, prelude::*};
+use {bevy::{asset::AssetMetaCheck, prelude::*},
+     bevy_mod_billboard::prelude::*};
 // use bevy::math::Affine2; // Not needed with voxel world
-use {avian3d::prelude::*, bevy::input::mouse::MouseMotion};
+use {avian3d::prelude::*,
+     bevy::input::mouse::{MouseMotion, MouseWheel}};
 // use avian3d::collision::AsyncCollider; // Not available in this version
 use {bevy_embedded_assets::EmbeddedAssetPlugin, bevy_voxel_world::prelude::*,
      enum_assoc::Assoc};
@@ -50,22 +52,32 @@ struct Player;
 struct Pizza;
 
 #[derive(Component)]
+struct PizzaTimer {
+  timer: Timer
+}
+
+impl PizzaTimer {
+  fn new() -> Self { Self { timer: Timer::from_seconds(3.0, TimerMode::Once) } }
+}
+
+#[derive(Component)]
 struct CityBlock {
   block_type: BlockType,
   position: IVec3
 }
 
 #[derive(Component)]
-struct Billboard;
-
-#[derive(Component)]
 struct Tree;
 
 #[derive(Component)]
-enum FacingMode {
-  PositionIgnoreY,
-  Position,
-  Direction
+struct Npc {
+  wants_pizza: bool
+}
+
+// Component to link sprites to their physics bodies
+#[derive(Component)]
+struct SpriteFollower {
+  target_entity: Entity
 }
 
 #[derive(Resource, Clone, Default)]
@@ -73,7 +85,7 @@ struct MyWorld;
 
 impl VoxelWorldConfig for MyWorld {
   type MaterialIndex = u8;
-  type ChunkUserBundle = (RigidBody, Collider);
+  type ChunkUserBundle = (RigidBody, Collider, Friction, Restitution);
 
   fn spawning_distance(&self) -> u32 { 50 }
 
@@ -96,11 +108,10 @@ struct GameAssets {
   player_texture: Handle<Image>,
   pizza_texture: Handle<Image>,
   tree_texture: Handle<Image>,
+  woman1_texture: Handle<Image>,
+  ducky_texture: Handle<Image>,
   blocks_layout: Handle<TextureAtlasLayout>,
   block_material: Handle<StandardMaterial>,
-  player_material: Handle<StandardMaterial>,
-  pizza_material: Handle<StandardMaterial>,
-  tree_material: Handle<StandardMaterial>,
   quad_mesh: Handle<Mesh>
 }
 
@@ -128,6 +139,7 @@ fn main() {
     .add_plugins(EmbeddedAssetPlugin::default())
     .add_plugins(PhysicsPlugins::default())
     .add_plugins(VoxelWorldPlugin::with_config(MyWorld))
+    .add_plugins(BillboardPlugin)
     .insert_resource(PlayerStats { pizzas_delivered: 0, pizzas_remaining: 10 })
     .add_systems(
       Startup,
@@ -140,8 +152,10 @@ fn main() {
         player_jump,
         throw_pizza,
         pizza_physics,
+        pizza_timer_system,
+        pizza_delivery_system,
+        sprite_follow_system,
         camera_follow_player,
-        face_camera_system,
         camera_controller,
         mouse_look
       )
@@ -161,6 +175,8 @@ fn setup_assets(
   let player_texture = asset_server.load("guy.png");
   let pizza_texture = asset_server.load("pizzabox.png");
   let tree_texture = asset_server.load("tree.png");
+  let woman1_texture = asset_server.load("woman1.png");
+  let ducky_texture = asset_server.load("ducky.png");
 
   // Remove texture atlas layout since voxel world handles textures
   let blocks_layout =
@@ -169,39 +185,17 @@ fn setup_assets(
   // Remove block_material since voxel world handles its own materials
   let block_material = materials.add(StandardMaterial::default());
 
-  let player_material = materials.add(StandardMaterial {
-    base_color_texture: Some(player_texture.clone()),
-    alpha_mode: AlphaMode::Blend,
-    unlit: false,
-    ..default()
-  });
-
-  let pizza_material = materials.add(StandardMaterial {
-    base_color_texture: Some(pizza_texture.clone()),
-    alpha_mode: AlphaMode::Blend,
-    unlit: false,
-    ..default()
-  });
-
-  let tree_material = materials.add(StandardMaterial {
-    base_color_texture: Some(tree_texture.clone()),
-    alpha_mode: AlphaMode::Blend,
-    unlit: false,
-    ..default()
-  });
-
-  let quad_mesh = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
+  let quad_mesh = meshes.add(Rectangle::new(1.0, 1.0));
   // Voxel materials are handled by the voxel world system
 
   commands.insert_resource(GameAssets {
     player_texture,
     pizza_texture,
     tree_texture,
+    woman1_texture,
+    ducky_texture,
     blocks_layout,
     block_material,
-    player_material,
-    pizza_material,
-    tree_material,
     quad_mesh
   });
 }
@@ -227,7 +221,8 @@ fn setup_voxel_world() {
 fn generate_city(
   mut voxel_world: VoxelWorld<MyWorld>,
   mut commands: Commands,
-  assets: Res<GameAssets>
+  assets: Res<GameAssets>,
+  mut meshes: ResMut<Assets<Mesh>>
 ) {
   use std::collections::HashMap;
 
@@ -254,7 +249,12 @@ fn generate_city(
         if x % block_size == 0 && z % block_size == 0 {
           let distance_from_center = ((x * x + z * z) as f32).sqrt();
           if distance_from_center < 30.0 {
-            spawn_tree(&mut commands, &assets, Vec3::new(x as f32, 0.0, z as f32));
+            spawn_tree(
+              &mut commands,
+              &assets,
+              &mut meshes,
+              Vec3::new(x as f32, 0.0, z as f32)
+            );
           }
         }
       } else {
@@ -262,6 +262,20 @@ fn generate_city(
           IVec3::new(x, 0, z),
           WorldVoxel::Solid(BlockType::Sidewalk.texture_coords() as u8)
         );
+
+        // Spawn NPCs on sidewalks occasionally
+        if (rng() % 100) == 0 {
+          let distance_from_center = ((x * x + z * z) as f32).sqrt();
+          if distance_from_center < 80.0 && distance_from_center > 10.0 {
+            spawn_npc(
+              &mut commands,
+              &assets,
+              &mut meshes,
+              Vec3::new(x as f32, 0.0, z as f32),
+              &mut rng
+            );
+          }
+        }
       }
     }
   }
@@ -292,8 +306,8 @@ fn generate_city(
 
         for bx in start_x.max(min_x)..(start_x + building_width).min(max_x) {
           for bz in start_z.max(min_z)..(start_z + building_depth).min(max_z) {
-            if !occupied.contains_key(&(bx, bz)) {
-              occupied.insert((bx, bz), true);
+            if let std::collections::hash_map::Entry::Vacant(e) = occupied.entry((bx, bz)) {
+              e.insert(true);
 
               for y in 1..=building_height {
                 let block_type = if y == building_height {
@@ -318,10 +332,58 @@ fn generate_city(
   }
 }
 
-fn spawn_tree(c: &mut Commands, assets: &GameAssets, position: Vec3) {
+fn spawn_npc(
+  c: &mut Commands,
+  assets: &GameAssets,
+  meshes: &mut ResMut<Assets<Mesh>>,
+  position: Vec3,
+  rng: &mut dyn FnMut() -> u32
+) {
+  let world_pos = Vec3::new(position.x * BLOCK_SIZE, 0.5, position.z * BLOCK_SIZE);
+
+  // Create physics body
+  let npc_entity = c
+    .spawn((
+      Transform::from_translation(world_pos),
+      RigidBody::Static,
+      Collider::capsule(0.3, 0.8),
+      Npc { wants_pizza: (rng() % 3) == 0 } // 1/3 chance of wanting pizza
+    ))
+    .id();
+
+  // Choose random NPC texture
+  let texture = if (rng() % 2) == 0 {
+    assets.woman1_texture.clone()
+  } else {
+    assets.ducky_texture.clone()
+  };
+
+  // Create sprite follower entity
+  let sprite_follower = c
+    .spawn((Transform::from_translation(world_pos), SpriteFollower {
+      target_entity: npc_entity
+    }))
+    .id();
+
+  // Create billboard as child of sprite follower
+  c.spawn((
+    BillboardTexture(texture),
+    BillboardMesh(meshes.add(Rectangle::new(1.65, 2.75))), // 10% taller
+    Transform::from_translation(Vec3::new(0.0, 1.375, 0.0)),
+    BillboardLockAxis::from_lock_y(true),
+    ChildOf(sprite_follower)
+  ));
+}
+
+fn spawn_tree(
+  c: &mut Commands,
+  assets: &GameAssets,
+  meshes: &mut ResMut<Assets<Mesh>>,
+  position: Vec3
+) {
   let world_pos = Vec3::new(position.x * BLOCK_SIZE, 1.0, position.z * BLOCK_SIZE);
 
-  // Create physics body (parent)
+  // Create physics body
   let tree_entity = c
     .spawn((
       Transform::from_translation(world_pos),
@@ -331,126 +393,196 @@ fn spawn_tree(c: &mut Commands, assets: &GameAssets, position: Vec3) {
     ))
     .id();
 
-  // Create sprite (child)
-  let sprite_entity = c
-    .spawn((
-      Mesh3d(assets.quad_mesh.clone()),
-      MeshMaterial3d(assets.tree_material.clone()),
-      Transform::from_translation(Vec3::ZERO).with_scale(Vec3::new(1.5, 2.0, 1.5)),
-      FacingMode::PositionIgnoreY
-    ))
+  // Create sprite follower entity
+  let sprite_follower = c
+    .spawn((Transform::from_translation(world_pos), SpriteFollower {
+      target_entity: tree_entity
+    }))
     .id();
 
-  // Make sprite a child of the physics body
-  c.entity(tree_entity).add_child(sprite_entity);
+  // Create billboard as child of sprite follower - position it so bottom of tree touches ground
+  c.spawn((
+    BillboardTexture(assets.tree_texture.clone()),
+    BillboardMesh(meshes.add(Rectangle::new(1.5, 2.0))),
+    Transform::from_translation(Vec3::new(0.0, 1.0, 0.0)), // Half the tree height above ground
+    BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
+    ChildOf(sprite_follower)
+  ));
 }
 
-fn spawn_player(mut c: Commands, assets: Res<GameAssets>) {
-  // Create physics body (parent)
+fn spawn_player(mut c: Commands, assets: Res<GameAssets>, mut meshes: ResMut<Assets<Mesh>>) {
+  // Spawn at (5, 3, 5) to avoid trees at intersections and be closer to ground
   let player_entity = c
     .spawn((
-      Transform::from_translation(Vec3::new(0.0, 6.0, 0.0)),
+      Transform::from_translation(Vec3::new(5.0, 70.0, 5.0)),
       RigidBody::Dynamic,
-      Collider::capsule(0.4, 1.0),
-      LockedAxes::ROTATION_LOCKED,
-      LinearDamping(0.5),
-      AngularDamping(10.0),
-      Friction::new(0.2),
-      Restitution::new(0.1),
-      Player
+      Collider::sphere(0.5), // Sphere collider for smoother physics
+      ColliderDensity(1.0),
+      // ColliderMassProperties::
+      // LockedAxes::ROTATION_LOCKED,
+      // LinearDamping(0.1), // Tiny bit of damping to prevent instability
+      // AngularDamping(10.0),
+      Friction::new(0.0),    // No physics friction - we implement our own
+      Restitution::new(0.0), // No bounciness for player
+      ExternalForce::default(), // For force-based movement
+      Player,
+      BillboardTexture(assets.player_texture.clone()),
+      BillboardMesh(meshes.add(Rectangle::new(1.0, 2.0))),
+      BillboardLockAxis::from_lock_y(true) // Lock Y axis for vertical billboards
     ))
     .id();
 
-  // Create sprite (child)
-  let sprite_entity = c
-    .spawn((
-      Mesh3d(assets.quad_mesh.clone()),
-      MeshMaterial3d(assets.player_material.clone()),
-      Transform::from_translation(Vec3::ZERO).with_scale(Vec3::new(1.0, 2.0, 1.0)),
-      FacingMode::PositionIgnoreY
-    ))
-    .id();
+  // Create sprite follower entity for billboard
+  // let sprite_follower = c
+  //   .spawn((Transform::from_translation(Vec3::new(5.0, 3.0, 5.0)), SpriteFollower {
+  //     target_entity: player_entity
+  //   }))
+  //   .id();
 
-  // Make sprite a child of the physics body
-  c.entity(player_entity).add_child(sprite_entity);
+  // Create billboard as child of sprite follower
+  // c.spawn((
+  //   BillboardTexture(assets.player_texture.clone()),
+  //   BillboardMesh(meshes.add(Rectangle::new(1.0, 2.0))),
+  //   Transform::from_translation(Vec3::new(0.0, 1.0, 0.0)), // Center the sprite vertically
+  //   BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
+  //   ChildOf(sprite_follower)
+  // ));
 }
 
 fn player_movement(
-  mut player_query: Query<&mut LinearVelocity, With<Player>>,
+  mut player_query: Query<(&mut ExternalForce, &LinearVelocity, Entity), With<Player>>,
+  player_transform_query: Query<&Transform, With<Player>>,
   camera_query: Query<&Transform, With<Camera3d>>,
   keyboard: Res<ButtonInput<KeyCode>>,
-  time: Res<Time>
+  spatial_query: SpatialQuery
 ) {
-  if let (Ok(mut velocity), Ok(camera_transform)) =
-    (player_query.single_mut(), camera_query.single())
+  if let (
+    Ok((mut external_force, velocity, player_entity)),
+    Ok(player_transform),
+    Ok(camera_transform)
+  ) = (player_query.single_mut(), player_transform_query.single(), camera_query.single())
   {
-    let mut direction = Vec3::ZERO;
+    // not persistent
+    external_force.persistent = false;
 
-    // Get camera's forward and right directions (projected onto horizontal plane)
+    // Check if player is on ground
+    // Player sphere collider has radius 0.5, so cast from bottom of sphere down
+    let ray_origin = player_transform.translation;
+    let ray_direction = Dir3::NEG_Y;
+    let max_distance = 0.7; // Short distance to detect very close ground
+    let filter = SpatialQueryFilter::default().with_excluded_entities([player_entity]);
+    let raycast_result =
+      spatial_query.cast_ray(ray_origin, ray_direction, max_distance, true, &filter);
+    let is_grounded = raycast_result.is_some() || true;
+
+    // Get input direction
     let camera_forward = camera_transform.forward().normalize();
     let camera_right = camera_transform.right().normalize();
-
-    // Project onto horizontal plane (remove Y component)
     let forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalize();
     let right = Vec3::new(camera_right.x, 0.0, camera_right.z).normalize();
 
-    if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
-      direction += forward;
-    }
-    if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
-      direction -= forward;
-    }
-    if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
-      direction -= right;
-    }
-    if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
-      direction += right;
-    }
 
-    direction = direction.normalize_or_zero();
-    let max_speed = 8.0;
-    let acceleration = 20.0;
+    let direction = [
+      // (key, contribution)
+      (KeyCode::KeyW, forward),
+      (KeyCode::ArrowUp, forward),
+      (KeyCode::KeyS, -forward),
+      (KeyCode::ArrowDown, -forward),
+      (KeyCode::KeyA, -right),
+      (KeyCode::ArrowLeft, -right),
+      (KeyCode::KeyD, right),
+      (KeyCode::ArrowRight, right)
+    ]
+    .into_iter()
+    .filter_map(|(key, v)| keyboard.pressed(key).then_some(v)) // keep the vector only if the key is down
+    .sum::<Vec3>() // Vec3 implements `Sum`
+    .normalize_or_zero(); // guard against “no input”
 
-    // Smooth acceleration towards target velocity
-    let target_velocity =
-      Vec3::new(direction.x * max_speed, velocity.y, direction.z * max_speed);
+    // Single force calculation per frame
+    let max_speed = 8.0; // Reduced from 12.0
+    let max_force = 200.0; // Reduced from 400.0  
+    let friction_force = 150.0; // Reduced from 300.0
+
+    // Current horizontal velocity
     let current_horizontal = Vec3::new(velocity.x, 0.0, velocity.z);
-    let target_horizontal = Vec3::new(target_velocity.x, 0.0, target_velocity.z);
+    let current_speed = current_horizontal.length();
 
-    let new_horizontal =
-      current_horizontal.move_towards(target_horizontal, acceleration * time.delta_secs());
+    // Debug control loss - log when velocity gets too high or when no input but still moving
+    // static mut DEBUG_COUNTER: u32 = 0;
+    // unsafe {
+    //   DEBUG_COUNTER += 1;
+    //   let has_input = direction.length() > 0.1;
 
-    velocity.x = new_horizontal.x;
-    velocity.z = new_horizontal.z;
+    //   if DEBUG_COUNTER % 60 == 0
+    //     && (current_speed > 6.0 || (!has_input && current_speed > 2.0))
+    //   {
+    //     println!(
+    //       "Control issue - pos: {:.2?}, grounded: {}, velocity: {:.2?}, input: {}, speed: {:.2}",
+    //       player_transform.translation, is_grounded, velocity.0, has_input, current_speed
+    //     );
+    //     if let Some(hit) = raycast_result {
+    //       println!("  Ground hit at distance: {:.3}", hit.distance);
+    //     }
+    //   }
+    // }
+
+    // Calculate single force for this frame
+    let final_force = if is_grounded {
+      if direction.length() > 0.1 {
+        // Moving: combine input force and friction
+        let speed_ratio = (current_speed / max_speed).min(1.0);
+        let input_force = direction * max_force * (1.0 - speed_ratio); // Scales to zero at max speed
+
+        // Custom friction: oppose current movement
+        let friction = if current_speed > 0.1 {
+          -current_horizontal.normalize() * friction_force * speed_ratio
+        } else {
+          Vec3::ZERO
+        };
+
+        input_force + friction
+      } else {
+        // Not moving: only friction to stop
+        if current_speed > 0.1 {
+          -current_horizontal.normalize() * friction_force
+        } else {
+          Vec3::ZERO
+        }
+      }
+    } else {
+      // In air: no forces applied
+      Vec3::ZERO
+    };
+
+    // Apply the calculated force (forces were cleared at frame start)
+    external_force.apply_force(final_force);
   }
 }
 
 fn player_jump(
-  mut player_query: Query<&mut LinearVelocity, With<Player>>,
+  mut player_query: Query<(&mut LinearVelocity, Entity), With<Player>>,
   keyboard: Res<ButtonInput<KeyCode>>,
   spatial_query: SpatialQuery,
   player_transform_query: Query<&Transform, With<Player>>
 ) {
-  if keyboard.just_pressed(KeyCode::Space) {
-    if let (Ok(mut velocity), Ok(transform)) =
-      (player_query.single_mut(), player_transform_query.single())
-    {
-      let ray_origin = transform.translation;
-      let ray_direction = Dir3::NEG_Y;
-      let max_distance = 1.1;
+  if keyboard.just_pressed(KeyCode::Space)
+    && let Ok((mut velocity, player_entity)) = player_query.single_mut()
+    && let Ok(transform) = player_transform_query.single()
+  {
+    // Cast ray from slightly above the player's feet to detect ground
+    let ray_origin = transform.translation + Vec3::new(0.0, -0.8, 0.0);
+    let ray_direction = Dir3::NEG_Y;
+    let max_distance = 0.3; // Shorter distance for more precise ground detection
 
-      if spatial_query
-        .cast_ray(
-          ray_origin,
-          ray_direction,
-          max_distance,
-          true,
-          &SpatialQueryFilter::default()
-        )
-        .is_some()
-      {
-        velocity.y = 12.0;
-      }
+    // Exclude the player entity from the raycast
+    let filter = SpatialQueryFilter::default().with_excluded_entities([player_entity]);
+
+    if let Some(_hit) =
+      spatial_query.cast_ray(ray_origin, ray_direction, max_distance, true, &filter)
+      && velocity.y.abs() < 2.0
+    {
+      // Direct velocity change for instant jump
+      velocity.y = 12.0;
     }
   }
 }
@@ -461,92 +593,161 @@ fn throw_pizza(
   mut stats: ResMut<PlayerStats>,
   player_query: Query<&Transform, With<Player>>,
   keyboard: Res<ButtonInput<KeyCode>>,
-  camera_query: Query<&Transform, (With<Camera3d>, Without<Player>)>
+  camera_query: Query<&Transform, (With<Camera3d>, Without<Player>)>,
+  mut meshes: ResMut<Assets<Mesh>>
 ) {
-  if keyboard.just_pressed(KeyCode::KeyE) && stats.pizzas_remaining > 0 {
-    if let (Ok(player_transform), Ok(camera_transform)) =
-      (player_query.single(), camera_query.single())
-    {
-      let throw_direction =
-        (*camera_transform.forward() + Vec3::new(0.0, 0.3, 0.0)).normalize();
-      let spawn_pos = player_transform.translation + Vec3::new(0.0, 1.0, 0.0);
+  if keyboard.just_pressed(KeyCode::KeyE)
+    && stats.pizzas_remaining > 0
+    && let Ok(player_transform) = player_query.single()
+    && let Ok(camera_transform) = camera_query.single()
+  {
+    let throw_direction =
+      (*camera_transform.forward() + Vec3::new(0.0, 0.3, 0.0)).normalize();
+    let spawn_pos = player_transform.translation + Vec3::new(0.0, 1.0, 0.0);
 
-      // Create physics body (parent)
-      let pizza_entity = commands
-        .spawn((
-          Transform::from_translation(spawn_pos),
-          RigidBody::Dynamic,
-          Collider::sphere(0.2),
-          LinearVelocity(throw_direction * 15.0),
-          Pizza
-        ))
-        .id();
+    // Create physics body with bouncy physics
+    let pizza_entity = commands
+      .spawn((
+        Transform::from_translation(spawn_pos),
+        RigidBody::Dynamic,
+        Collider::sphere(0.2),
+        LinearVelocity(throw_direction * 15.0),
+        Restitution::new(0.8), // High bounciness
+        Friction::new(0.0),
+        LinearDamping(0.0),
+        AngularDamping(1.0), // Moderate spin damping
+        Pizza,
+        PizzaTimer::new()
+      ))
+      .id();
 
-      // Create sprite (child)
-      let sprite_entity = commands
-        .spawn((
-          Mesh3d(assets.quad_mesh.clone()),
-          MeshMaterial3d(assets.pizza_material.clone()),
-          Transform::from_translation(Vec3::ZERO).with_scale(Vec3::splat(1.0)),
-          FacingMode::PositionIgnoreY
-        ))
-        .id();
+    // Create sprite follower entity
+    let sprite_follower = commands
+      .spawn((Transform::from_translation(spawn_pos), SpriteFollower {
+        target_entity: pizza_entity
+      }))
+      .id();
 
-      // Make sprite a child of the physics body
-      commands.entity(pizza_entity).add_child(sprite_entity);
+    // Create billboard as child of sprite follower
+    commands.spawn((
+      BillboardTexture(assets.pizza_texture.clone()),
+      BillboardMesh(meshes.add(Rectangle::new(1.0, 1.0))),
+      Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
+      BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
+      ChildOf(sprite_follower)
+    ));
 
-      stats.pizzas_remaining -= 1;
-    }
+    stats.pizzas_remaining -= 1;
   }
 }
 
 fn pizza_physics(
   pizza_query: Query<(Entity, &Transform), With<Pizza>>,
+  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
   mut commands: Commands,
   mut stats: ResMut<PlayerStats>
 ) {
   for (entity, transform) in pizza_query.iter() {
+    let mut should_despawn = false;
+    let mut delivered = false;
+
+    // Despawn if falls too far
     if transform.translation.y < -10.0 {
-      commands.entity(entity).despawn();
+      should_despawn = true;
     }
 
+    // Successful delivery if pizza travels far from origin
     if transform.translation.distance(Vec3::ZERO) > 100.0 {
+      should_despawn = true;
+      delivered = true;
+    }
+
+    if should_despawn {
+      // Find and despawn associated sprite followers
+      for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
+        if sprite_follower.target_entity == entity {
+          commands.entity(follower_entity).despawn();
+        }
+      }
+
       commands.entity(entity).despawn();
-      stats.pizzas_delivered += 1;
+
+      if delivered {
+        stats.pizzas_delivered += 1;
+      }
     }
   }
 }
 
-// this is code from another game
-pub fn face_camera_system(
-  camera_q: Query<&Transform, With<Camera3d>>,
-  mut facers_q: Query<(&mut Transform, &GlobalTransform, &FacingMode), Without<Camera3d>>
+fn pizza_delivery_system(
+  pizza_query: Query<(Entity, &Transform), With<Pizza>>,
+  mut npc_query: Query<(Entity, &Transform, &mut Npc)>,
+  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
+  mut commands: Commands,
+  mut stats: ResMut<PlayerStats>
 ) {
-  if let Ok(cam_transform) = camera_q.single() {
-    for (mut transform, global, mode) in &mut facers_q {
-      let billboard_pos = global.translation();
-      let camera_pos = cam_transform.translation;
+  for (pizza_entity, pizza_transform) in pizza_query.iter() {
+    for (_npc_entity, npc_transform, mut npc) in npc_query.iter_mut() {
+      // Check if NPC wants pizza and pizza is close enough
+      if npc.wants_pizza {
+        let distance = pizza_transform.translation.distance(npc_transform.translation);
+        if distance < 3.0 {
+          // Increased delivery range
+          // Mark NPC as satisfied
+          npc.wants_pizza = false;
 
-      let direction = match mode {
-        FacingMode::PositionIgnoreY => (camera_pos - billboard_pos).with_y(0.0).normalize(),
-        FacingMode::Position => (camera_pos - billboard_pos).normalize(),
-        FacingMode::Direction => cam_transform.forward().as_vec3()
-      };
+          // Remove pizza and its sprite
+          for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
+            if sprite_follower.target_entity == pizza_entity {
+              commands.entity(follower_entity).despawn();
+            }
+          }
+          commands.entity(pizza_entity).despawn();
 
-      // Preserve scale and translation
-      let old_scale = transform.scale;
-      let old_translation = transform.translation;
+          // Increment delivery counter
+          stats.pizzas_delivered += 1;
 
-      // Calculate rotation to face camera
-      // Invert the angle to fix opposite rotation direction, then add 90 degrees counter-clockwise
-      let angle = -direction.z.atan2(direction.x) + std::f32::consts::FRAC_PI_2;
-      // Rotate around Y axis and then tilt to face camera (positive X rotation to face forward)
-      let rotation = Quat::from_rotation_y(angle) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+          break; // Exit NPC loop for this pizza
+        }
+      }
+    }
+  }
+}
 
-      // Apply only rotation, preserve position and scale
-      transform.rotation = rotation;
-      transform.scale = old_scale;
-      transform.translation = old_translation;
+fn pizza_timer_system(
+  mut pizza_query: Query<(Entity, &mut PizzaTimer), With<Pizza>>,
+  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
+  mut commands: Commands,
+  time: Res<Time>
+) {
+  for (entity, mut pizza_timer) in pizza_query.iter_mut() {
+    pizza_timer.timer.tick(time.delta());
+
+    // Despawn pizza after 3 seconds if not delivered
+    if pizza_timer.timer.finished() {
+      // Find and despawn associated sprite followers
+      for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
+        if sprite_follower.target_entity == entity {
+          commands.entity(follower_entity).despawn();
+        }
+      }
+
+      commands.entity(entity).despawn();
+    }
+  }
+}
+
+fn sprite_follow_system(
+  mut sprite_query: Query<(&mut Transform, &SpriteFollower)>,
+  target_query: Query<
+    &Transform,
+    (Without<SpriteFollower>, Or<(With<Pizza>, With<Tree>, With<Npc>, With<Player>)>)
+  >
+) {
+  for (mut sprite_transform, follower) in sprite_query.iter_mut() {
+    if let Ok(target_transform) = target_query.get(follower.target_entity) {
+      // Position sprite at the same location as physics body
+      sprite_transform.translation = target_transform.translation;
     }
   }
 }
@@ -580,12 +781,7 @@ fn camera_controller(
     if keyboard.pressed(KeyCode::KeyC) {
       controller.pitch = (controller.pitch + 1.0 * time.delta_secs()).clamp(-1.5, 0.0);
     }
-    if keyboard.pressed(KeyCode::Equal) {
-      controller.distance = (controller.distance - 10.0 * time.delta_secs()).max(5.0);
-    }
-    if keyboard.pressed(KeyCode::Minus) {
-      controller.distance = (controller.distance + 10.0 * time.delta_secs()).min(50.0);
-    }
+    // Zoom controls moved to mouse wheel in mouse_look function
 
     let rotation = Quat::from_euler(EulerRot::YXZ, controller.yaw, controller.pitch, 0.0);
     let offset = rotation * Vec3::new(0.0, 0.0, controller.distance);
@@ -598,6 +794,7 @@ fn camera_controller(
 fn mouse_look(
   mut camera_query: Query<&mut CameraController>,
   mut mouse_motion: EventReader<MouseMotion>,
+  mut mouse_wheel: EventReader<MouseWheel>,
   mouse_button: Res<ButtonInput<MouseButton>>
 ) {
   if let Ok(mut controller) = camera_query.single_mut() {
@@ -607,31 +804,10 @@ fn mouse_look(
         controller.pitch = (controller.pitch - event.delta.y * 0.003).clamp(-1.5, 0.0);
       }
     }
-  }
-}
 
-fn billboard_system(
-  mut billboard_query: Query<&mut Transform, (With<Billboard>, Without<Camera3d>)>,
-  camera_query: Query<&Transform, (With<Camera3d>, Without<Billboard>)>
-) {
-  if let Ok(camera_transform) = camera_query.single() {
-    for mut transform in billboard_query.iter_mut() {
-      let position = transform.translation;
-      let camera_pos = camera_transform.translation;
-
-      // Calculate direction from billboard to camera
-      let direction = (camera_pos - position).normalize();
-
-      // Create rotation to face camera, constrained to Y axis
-      let angle = direction.z.atan2(direction.x);
-      let rotation = Quat::from_rotation_y(angle - std::f32::consts::FRAC_PI_2);
-
-      // Apply rotation while preserving position and scale
-      let old_scale = transform.scale;
-      let old_translation = transform.translation;
-      transform.rotation = rotation;
-      transform.scale = old_scale;
-      transform.translation = old_translation;
+    // Handle mouse wheel zoom
+    for event in mouse_wheel.read() {
+      controller.distance = (controller.distance - event.y * 2.0).clamp(5.0, 50.0);
     }
   }
 }
@@ -642,15 +818,17 @@ fn add_colliders_to_chunks(
   meshes: Res<Assets<Mesh>>
 ) {
   for (entity, mesh3d) in mesh_query.iter() {
-    if let Some(mesh) = meshes.get(&mesh3d.0) {
-      // Check if mesh has vertices before creating trimesh collider
-      if let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
-        if !positions.is_empty() {
-          if let Some(collider) = Collider::trimesh_from_mesh(mesh) {
-            commands.entity(entity).insert((RigidBody::Static, collider));
-          }
-        }
-      }
+    if let Some(mesh) = meshes.get(&mesh3d.0)
+      && let Some(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+      && !positions.is_empty()
+      && let Some(collider) = Collider::trimesh_from_mesh(mesh)
+    {
+      commands.entity(entity).insert((
+        RigidBody::Static,
+        collider,
+        Friction::new(0.0),    // No friction on ground
+        Restitution::new(0.0)  // No bouncing for ground
+      ));
     }
   }
 }
@@ -664,48 +842,58 @@ fn update_ui(
     commands.entity(entity).despawn();
   }
 
-  commands.spawn(Node::default()).with_children(|parent| {
-        parent.spawn((
-            Text::new(format!("Pizzas Remaining: {}", stats.pizzas_remaining)),
-            TextFont {
-                font_size: 24.0,
-                ..default()
-            },
-            TextColor(Color::WHITE),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(10.0),
-                left: Val::Px(10.0),
-                ..default()
-            },
-        ));
-        parent.spawn((
-            Text::new(format!("Pizzas Delivered: {}", stats.pizzas_delivered)),
-            TextFont {
-                font_size: 24.0,
-                ..default()
-            },
-            TextColor(Color::WHITE),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(40.0),
-                left: Val::Px(10.0),
-                ..default()
-            },
-        ));
-        parent.spawn((
-            Text::new("Controls: WASD = Move, Space = Jump, E = Throw Pizza, Right Click + Mouse = Look, QX = Rotate, ZC = Pitch, +- = Zoom"),
-            TextFont {
-                font_size: 16.0,
-                ..default()
-            },
-            TextColor(Color::WHITE),
-            Node {
-                position_type: PositionType::Absolute,
-                bottom: Val::Px(10.0),
-                left: Val::Px(10.0),
-                ..default()
-            },
-        ));
+  // Top-left UI panel
+  commands
+    .spawn((
+      Node {
+        position_type: PositionType::Absolute,
+        top: Val::Px(20.0),
+        left: Val::Px(20.0),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(10.0),
+        padding: UiRect::all(Val::Px(15.0)),
+        ..default()
+      },
+      BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)) // Semi-transparent background
+    ))
+    .with_children(|parent| {
+      parent.spawn((
+        Text::new(format!("Pizzas Remaining: {}", stats.pizzas_remaining)),
+        TextFont { font_size: 24.0, ..default() },
+        TextColor(Color::WHITE)
+      ));
+
+      parent.spawn((
+        Text::new(format!("Pizzas Delivered: {}", stats.pizzas_delivered)),
+        TextFont { font_size: 24.0, ..default() },
+        TextColor(Color::WHITE)
+      ));
     });
+
+  // Bottom controls text
+  commands.spawn((
+    Node {
+      position_type: PositionType::Absolute,
+      bottom: Val::Px(20.0),
+      left: Val::Px(20.0),
+      right: Val::Px(20.0),
+      padding: UiRect::all(Val::Px(15.0)),
+      justify_content: JustifyContent::Center,
+      ..default()
+    },
+    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+  )).with_children(|parent| {
+    parent.spawn((
+      Text::new("Controls: WASD = Move, Space = Jump, E = Throw Pizza, Right Click + Mouse = Look, QX = Rotate, ZC = Pitch, Mouse Wheel = Zoom"),
+      TextFont {
+        font_size: 16.0,
+        ..default()
+      },
+      TextColor(Color::WHITE),
+      Node {
+        max_width: Val::Percent(100.0),
+        ..default()
+      },
+    ));
+  });
 }
