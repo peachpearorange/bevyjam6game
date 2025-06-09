@@ -58,7 +58,7 @@ impl BlockType {
   fn get_texture_atlas_index(self) -> usize { self.texture_coords() as usize }
 }
 
-const CITY_SIZE: i32 = 120;
+const CITY_SIZE: i32 = 40;
 const BLOCK_SIZE: f32 = 1.0;
 const BUILDING_HEIGHT_MIN: i32 = 5;
 const BUILDING_HEIGHT_MAX: i32 = 35;
@@ -96,11 +96,7 @@ struct Npc {
   satisfied: bool
 }
 
-// Component to link sprites to their physics bodies
-#[derive(Component)]
-struct SpriteFollower {
-  target_entity: Entity
-}
+// SpriteFollower component removed - entities are now self-contained
 
 #[derive(Resource, Clone, Default)]
 struct MyWorld;
@@ -109,7 +105,7 @@ impl VoxelWorldConfig for MyWorld {
   type MaterialIndex = u8;
   type ChunkUserBundle = (RigidBody, Collider, Friction, Restitution);
 
-  fn spawning_distance(&self) -> u32 { 50 }
+  fn spawning_distance(&self) -> u32 { 100 }
 
   fn texture_index_mapper(&self) -> std::sync::Arc<dyn Fn(u8) -> [u32; 3] + Send + Sync> {
     std::sync::Arc::new(|material_index: u8| {
@@ -134,7 +130,11 @@ struct GameAssets {
   ducky_texture: Handle<Image>,
   blocks_layout: Handle<TextureAtlasLayout>,
   block_material: Handle<StandardMaterial>,
-  quad_mesh: Handle<Mesh>
+  quad_mesh: Handle<Mesh>,
+  npc_mesh: Handle<Mesh>,
+  player_mesh: Handle<Mesh>,
+  tree_mesh: Handle<Mesh>,
+  pizza_mesh: Handle<Mesh>
 }
 
 #[derive(Resource)]
@@ -177,7 +177,7 @@ fn main() {
         pizza_physics,
         pizza_timer_system,
         pizza_delivery_system,
-        sprite_follow_system,
+        // sprite_follow_system, // Removed - no longer needed
         camera_follow_player,
         camera_controller,
         mouse_look
@@ -209,7 +209,10 @@ fn setup_assets(
   let block_material = materials.add(StandardMaterial::default());
 
   let quad_mesh = meshes.add(Rectangle::new(1.0, 1.0));
-  // Voxel materials are handled by the voxel world system
+  let npc_mesh = meshes.add(Rectangle::new(1.0, 2.0));
+  let player_mesh = meshes.add(Rectangle::new(1.0, 2.0));
+  let tree_mesh = meshes.add(Rectangle::new(1.5, 2.0));
+  let pizza_mesh = meshes.add(Rectangle::new(1.0, 1.0));
 
   commands.insert_resource(GameAssets {
     player_texture,
@@ -219,7 +222,11 @@ fn setup_assets(
     ducky_texture,
     blocks_layout,
     block_material,
-    quad_mesh
+    quad_mesh,
+    npc_mesh,
+    player_mesh,
+    tree_mesh,
+    pizza_mesh
   });
 }
 
@@ -379,10 +386,8 @@ fn place_building_block(
     BlockType::Building
   };
 
-  voxel_world.set_voxel(
-    IVec3::new(x, y, z),
-    WorldVoxel::Solid(block_type.texture_coords() as u8)
-  );
+  voxel_world
+    .set_voxel(IVec3::new(x, y, z), WorldVoxel::Solid(block_type.texture_coords() as u8));
 }
 
 fn generate_complex_building(
@@ -406,18 +411,118 @@ fn generate_complex_building(
   };
 
   println!("Generating building: {:?} shape at ({}, {})", shape, start_x, start_z);
-  
+
   match shape {
-    BuildingShape::Simple => generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::Tower => generate_tower_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::Stepped => generate_stepped_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::LShape => generate_l_shaped_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::Courtyard => generate_courtyard_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::CrossShape => generate_cross_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::TShape => generate_t_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::MultipleTowers => generate_multiple_towers_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::Curved => generate_curved_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
-    BuildingShape::Ziggurat => generate_ziggurat_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng)
+    BuildingShape::Simple => generate_simple_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::Tower => generate_tower_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::Stepped => generate_stepped_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::LShape => generate_l_shaped_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::Courtyard => generate_courtyard_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::CrossShape => generate_cross_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::TShape => generate_t_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::MultipleTowers => generate_multiple_towers_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::Curved => generate_curved_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    ),
+    BuildingShape::Ziggurat => generate_ziggurat_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    )
   }
 }
 
@@ -435,12 +540,14 @@ fn generate_simple_building(
   for bx in start_x..(start_x + width) {
     for bz in start_z..(start_z + depth) {
       occupied.insert((bx, bz), true);
-      
+
       for y in 1..=height {
-        let is_edge = bx == start_x || bx == start_x + width - 1 ||
-                     bz == start_z || bz == start_z + depth - 1;
+        let is_edge = bx == start_x
+          || bx == start_x + width - 1
+          || bz == start_z
+          || bz == start_z + depth - 1;
         let is_top = y == height;
-        
+
         place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
       }
     }
@@ -460,21 +567,33 @@ fn generate_tower_building(
 ) {
   // Base building (70% of height)
   let base_height = (height as f32 * 0.7) as i32;
-  generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, base_height, building_type, rng);
-  
+  generate_simple_building(
+    voxel_world,
+    occupied,
+    start_x,
+    start_z,
+    width,
+    depth,
+    base_height,
+    building_type,
+    rng
+  );
+
   // Tower section (smaller, centered)
   let tower_width = width / 2 + 1;
   let tower_depth = depth / 2 + 1;
   let tower_start_x = start_x + (width - tower_width) / 2;
   let tower_start_z = start_z + (depth - tower_depth) / 2;
-  
+
   for bx in tower_start_x..(tower_start_x + tower_width) {
     for bz in tower_start_z..(tower_start_z + tower_depth) {
       for y in (base_height + 1)..=height {
-        let is_edge = bx == tower_start_x || bx == tower_start_x + tower_width - 1 ||
-                     bz == tower_start_z || bz == tower_start_z + tower_depth - 1;
+        let is_edge = bx == tower_start_x
+          || bx == tower_start_x + tower_width - 1
+          || bz == tower_start_z
+          || bz == tower_start_z + tower_depth - 1;
         let is_top = y == height;
-        
+
         place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
       }
     }
@@ -494,7 +613,7 @@ fn generate_stepped_building(
 ) {
   let steps = 3.min(height / 4);
   let step_height = height / (steps + 1);
-  
+
   for step in 0..=steps {
     let step_shrink = step * 2;
     let step_width = (width - step_shrink).max(3);
@@ -502,19 +621,22 @@ fn generate_stepped_building(
     let step_start_x = start_x + step_shrink / 2;
     let step_start_z = start_z + step_shrink / 2;
     let step_max_height = height - (step * step_height);
-    let step_min_height = if step == 0 { 1 } else { height - ((step - 1) * step_height) + 1 };
-    
+    let step_min_height =
+      if step == 0 { 1 } else { height - ((step - 1) * step_height) + 1 };
+
     for bx in step_start_x..(step_start_x + step_width) {
       for bz in step_start_z..(step_start_z + step_depth) {
         if step == 0 {
           occupied.insert((bx, bz), true);
         }
-        
+
         for y in step_min_height..=step_max_height {
-          let is_edge = bx == step_start_x || bx == step_start_x + step_width - 1 ||
-                       bz == step_start_z || bz == step_start_z + step_depth - 1;
+          let is_edge = bx == step_start_x
+            || bx == step_start_x + step_width - 1
+            || bz == step_start_z
+            || bz == step_start_z + step_depth - 1;
           let is_top = y == step_max_height;
-          
+
           place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
         }
       }
@@ -539,28 +661,33 @@ fn generate_l_shaped_building(
   let wing2_width = width / 2 + 1;
   let wing2_depth = depth - wing1_depth;
   let wing2_start_z = start_z + wing1_depth;
-  
+
   // Build wing 1 (horizontal bar)
   for bx in start_x..(start_x + wing1_width) {
     for bz in start_z..(start_z + wing1_depth) {
       occupied.insert((bx, bz), true);
       for y in 1..=height {
-        let is_edge = bx == start_x || bx == start_x + wing1_width - 1 ||
-                     bz == start_z || bz == start_z + wing1_depth - 1;
+        let is_edge = bx == start_x
+          || bx == start_x + wing1_width - 1
+          || bz == start_z
+          || bz == start_z + wing1_depth - 1;
         let is_top = y == height;
         place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
       }
     }
   }
-  
+
   // Build wing 2 (vertical bar)
   for bx in start_x..(start_x + wing2_width) {
     for bz in wing2_start_z..(wing2_start_z + wing2_depth) {
-      if !occupied.contains_key(&(bx, bz)) { // Don't override existing blocks
+      if !occupied.contains_key(&(bx, bz)) {
+        // Don't override existing blocks
         occupied.insert((bx, bz), true);
         for y in 1..=height {
-          let is_edge = bx == start_x || bx == start_x + wing2_width - 1 ||
-                       bz == wing2_start_z || bz == wing2_start_z + wing2_depth - 1;
+          let is_edge = bx == start_x
+            || bx == start_x + wing2_width - 1
+            || bz == wing2_start_z
+            || bz == wing2_start_z + wing2_depth - 1;
           let is_top = y == height;
           place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
         }
@@ -582,33 +709,50 @@ fn generate_courtyard_building(
 ) {
   // Only create courtyard if building is large enough
   if width < 8 || depth < 8 {
-    generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng);
+    generate_simple_building(
+      voxel_world,
+      occupied,
+      start_x,
+      start_z,
+      width,
+      depth,
+      height,
+      building_type,
+      rng
+    );
     return;
   }
-  
+
   // Courtyard dimensions (inner empty space)
   let courtyard_width = width / 3;
   let courtyard_depth = depth / 3;
   let courtyard_start_x = start_x + (width - courtyard_width) / 2;
   let courtyard_start_z = start_z + (depth - courtyard_depth) / 2;
-  
+
   for bx in start_x..(start_x + width) {
     for bz in start_z..(start_z + depth) {
       // Skip courtyard area
-      if bx >= courtyard_start_x && bx < courtyard_start_x + courtyard_width &&
-         bz >= courtyard_start_z && bz < courtyard_start_z + courtyard_depth {
+      if bx >= courtyard_start_x
+        && bx < courtyard_start_x + courtyard_width
+        && bz >= courtyard_start_z
+        && bz < courtyard_start_z + courtyard_depth
+      {
         continue;
       }
-      
+
       occupied.insert((bx, bz), true);
-      
+
       for y in 1..=height {
-        let is_edge = bx == start_x || bx == start_x + width - 1 ||
-                     bz == start_z || bz == start_z + depth - 1 ||
-                     bx == courtyard_start_x - 1 || bx == courtyard_start_x + courtyard_width ||
-                     bz == courtyard_start_z - 1 || bz == courtyard_start_z + courtyard_depth;
+        let is_edge = bx == start_x
+          || bx == start_x + width - 1
+          || bz == start_z
+          || bz == start_z + depth - 1
+          || bx == courtyard_start_x - 1
+          || bx == courtyard_start_x + courtyard_width
+          || bz == courtyard_start_z - 1
+          || bz == courtyard_start_z + courtyard_depth;
         let is_top = y == height;
-        
+
         place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
       }
     }
@@ -628,36 +772,40 @@ fn generate_cross_building(
 ) {
   let arm_width = width / 3;
   let arm_depth = depth / 3;
-  
+
   // Horizontal bar
   let h_start_x = start_x;
   let h_start_z = start_z + depth / 2 - arm_depth / 2;
-  
+
   // Vertical bar
   let v_start_x = start_x + width / 2 - arm_width / 2;
   let v_start_z = start_z;
-  
+
   // Build horizontal bar
   for bx in h_start_x..(h_start_x + width) {
     for bz in h_start_z..(h_start_z + arm_depth) {
       occupied.insert((bx, bz), true);
       for y in 1..=height {
-        let is_edge = bx == h_start_x || bx == h_start_x + width - 1 ||
-                     bz == h_start_z || bz == h_start_z + arm_depth - 1;
+        let is_edge = bx == h_start_x
+          || bx == h_start_x + width - 1
+          || bz == h_start_z
+          || bz == h_start_z + arm_depth - 1;
         let is_top = y == height;
         place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
       }
     }
   }
-  
+
   // Build vertical bar
   for bx in v_start_x..(v_start_x + arm_width) {
     for bz in v_start_z..(v_start_z + depth) {
       if !occupied.contains_key(&(bx, bz)) {
         occupied.insert((bx, bz), true);
         for y in 1..=height {
-          let is_edge = bx == v_start_x || bx == v_start_x + arm_width - 1 ||
-                       bz == v_start_z || bz == v_start_z + depth - 1;
+          let is_edge = bx == v_start_x
+            || bx == v_start_x + arm_width - 1
+            || bz == v_start_z
+            || bz == v_start_z + depth - 1;
           let is_top = y == height;
           place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
         }
@@ -679,14 +827,34 @@ fn generate_t_building(
 ) {
   // Top horizontal bar
   let bar_depth = depth / 3;
-  generate_simple_building(voxel_world, occupied, start_x, start_z, width, bar_depth, height, building_type, rng);
-  
+  generate_simple_building(
+    voxel_world,
+    occupied,
+    start_x,
+    start_z,
+    width,
+    bar_depth,
+    height,
+    building_type,
+    rng
+  );
+
   // Vertical stem
   let stem_width = width / 3;
   let stem_start_x = start_x + width / 2 - stem_width / 2;
   let stem_start_z = start_z + bar_depth;
   let stem_depth = depth - bar_depth;
-  generate_simple_building(voxel_world, occupied, stem_start_x, stem_start_z, stem_width, stem_depth, height, building_type, rng);
+  generate_simple_building(
+    voxel_world,
+    occupied,
+    stem_start_x,
+    stem_start_z,
+    stem_width,
+    stem_depth,
+    height,
+    building_type,
+    rng
+  );
 }
 
 fn generate_multiple_towers_building(
@@ -702,27 +870,52 @@ fn generate_multiple_towers_building(
 ) {
   // Base platform
   let base_height = height / 3;
-  generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, base_height, building_type, rng);
-  
+  generate_simple_building(
+    voxel_world,
+    occupied,
+    start_x,
+    start_z,
+    width,
+    depth,
+    base_height,
+    building_type,
+    rng
+  );
+
   // Multiple towers on the base
   let tower_size = (width.min(depth)) / 3;
   let positions = [
     (start_x + 1, start_z + 1),
     (start_x + width - tower_size - 1, start_z + 1),
     (start_x + 1, start_z + depth - tower_size - 1),
-    (start_x + width - tower_size - 1, start_z + depth - tower_size - 1),
+    (start_x + width - tower_size - 1, start_z + depth - tower_size - 1)
   ];
-  
+
   for (tx, tz) in positions.iter() {
-    if *tx >= start_x && *tz >= start_z && *tx + tower_size <= start_x + width && *tz + tower_size <= start_z + depth {
+    if *tx >= start_x
+      && *tz >= start_z
+      && *tx + tower_size <= start_x + width
+      && *tz + tower_size <= start_z + depth
+    {
       let tower_height = base_height + (height - base_height) * (3 + (rng() % 3) as i32) / 4;
       for bx in *tx..(*tx + tower_size) {
         for bz in *tz..(*tz + tower_size) {
           for y in (base_height + 1)..=tower_height {
-            let is_edge = bx == *tx || bx == *tx + tower_size - 1 ||
-                         bz == *tz || bz == *tz + tower_size - 1;
+            let is_edge = bx == *tx
+              || bx == *tx + tower_size - 1
+              || bz == *tz
+              || bz == *tz + tower_size - 1;
             let is_top = y == tower_height;
-            place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+            place_building_block(
+              voxel_world,
+              bx,
+              y,
+              bz,
+              building_type,
+              is_edge,
+              is_top,
+              rng
+            );
           }
         }
       }
@@ -745,17 +938,17 @@ fn generate_curved_building(
   let center_x = start_x + width / 2;
   let center_z = start_z + depth / 2;
   let radius = width.min(depth) as f32 / 2.0 - 1.0;
-  
+
   for bx in start_x..(start_x + width) {
     for bz in start_z..(start_z + depth) {
       let dx = (bx - center_x) as f32;
       let dz = (bz - center_z) as f32;
       let distance = (dx * dx + dz * dz).sqrt();
-      
+
       // Create a ring-shaped building (curved walls with hollow center)
       if distance >= radius - 2.0 && distance <= radius + 1.0 {
         occupied.insert((bx, bz), true);
-        
+
         for y in 1..=height {
           let is_edge = distance >= radius + 0.5 || distance <= radius - 1.5;
           let is_top = y == height;
@@ -780,7 +973,7 @@ fn generate_ziggurat_building(
   // More dramatic stepped pyramid with multiple levels
   let levels = 5.min(height / 3);
   let level_height = height / levels;
-  
+
   for level in 0..levels {
     let shrink = level * 2;
     let level_width = (width - shrink).max(3);
@@ -789,18 +982,20 @@ fn generate_ziggurat_building(
     let level_start_z = start_z + shrink / 2;
     let level_bottom = level * level_height + 1;
     let level_top = (level + 1) * level_height;
-    
+
     for bx in level_start_x..(level_start_x + level_width) {
       for bz in level_start_z..(level_start_z + level_depth) {
         if level == 0 {
           occupied.insert((bx, bz), true);
         }
-        
+
         for y in level_bottom..=level_top {
-          let is_edge = bx == level_start_x || bx == level_start_x + level_width - 1 ||
-                       bz == level_start_z || bz == level_start_z + level_depth - 1;
+          let is_edge = bx == level_start_x
+            || bx == level_start_x + level_width - 1
+            || bz == level_start_z
+            || bz == level_start_z + level_depth - 1;
           let is_top = y == level_top;
-          
+
           place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
         }
       }
@@ -811,8 +1006,7 @@ fn generate_ziggurat_building(
 fn generate_city(
   mut voxel_world: VoxelWorld<MyWorld>,
   mut commands: Commands,
-  assets: Res<GameAssets>,
-  mut meshes: ResMut<Assets<Mesh>>
+  assets: Res<GameAssets>
 ) {
   use std::collections::HashMap;
 
@@ -850,12 +1044,7 @@ fn generate_city(
         if (x % 30 == 0 && z % 30 == 0) && district == DistrictType::Park {
           let distance_from_center = ((x * x + z * z) as f32).sqrt();
           if distance_from_center < 50.0 && (rng() % 3) == 0 {
-            spawn_tree(
-              &mut commands,
-              &assets,
-              &mut meshes,
-              Vec3::new(x as f32, 0.0, z as f32)
-            );
+            spawn_tree(&mut commands, &assets, Vec3::new(x as f32, 0.0, z as f32));
           }
         }
       } else {
@@ -887,17 +1076,14 @@ fn generate_city(
             WorldVoxel::Solid(BlockType::Sidewalk.texture_coords() as u8)
           );
 
-          // Spawn NPCs on sidewalks in populated districts
-          let district = get_district_type(x, z);
-          if matches!(district, DistrictType::Downtown | DistrictType::Commercial)
-            && (rng() % 200) == 0
-          {
+          // Spawn NPCs on sidewalks frequently for testing
+          if (rng() % 50) == 0 {
             let distance_from_center = ((x * x + z * z) as f32).sqrt();
-            if distance_from_center < 100.0 && distance_from_center > 15.0 {
+            if distance_from_center < 200.0 && distance_from_center > 20.0 {
+              println!("Spawning NPC at ({}, {})", x, z);
               spawn_npc(
                 &mut commands,
                 &assets,
-                &mut meshes,
                 Vec3::new(x as f32, 0.0, z as f32),
                 &mut rng
               );
@@ -915,18 +1101,20 @@ fn generate_city(
 
   // Second pass: simple building generation
   let mut buildings_placed = 0;
-  
-  // Place buildings on a simple grid
-  for x in (-50..50).step_by(12) {
-    for z in (-50..50).step_by(12) {
+
+  // Place buildings on a much larger grid
+  for x in (-250..250).step_by(10) {
+    for z in (-250..250).step_by(10) {
       // Skip some randomly for variety
-      if (rng() % 100) < 20 { continue; }
-      
+      if (rng() % 100) < 20 {
+        continue;
+      }
+
       let building_type = get_building_type_for_district(DistrictType::Downtown, &mut rng);
-      let width = 4 + (rng() % 6) as i32;
-      let depth = 4 + (rng() % 6) as i32; 
-      let height = 8 + (rng() % 15) as i32;
-      
+      let width = 3 + (rng() % 5) as i32;
+      let depth = 3 + (rng() % 5) as i32;
+      let height = 2 + (rng() % 4) as i32; // Much shorter: 2-5 blocks
+
       generate_complex_building(
         &mut voxel_world,
         &mut occupied,
@@ -947,115 +1135,50 @@ fn generate_city(
 fn spawn_npc(
   c: &mut Commands,
   assets: &GameAssets,
-  meshes: &mut ResMut<Assets<Mesh>>,
   position: Vec3,
-  rng: &mut dyn FnMut() -> u32
-) {
-  let world_pos = Vec3::new(position.x * BLOCK_SIZE, 0.5, position.z * BLOCK_SIZE);
-
-  // Create physics body
-  let npc_entity = c
-    .spawn((
-      Transform::from_translation(world_pos),
-      RigidBody::Static,
-      Collider::capsule(0.3, 0.8),
-      Npc { wants_pizza: true, satisfied: false }
-    ))
-    .id();
-
-  // Use woman1 texture for all NPCs
-  let texture = assets.woman1_texture.clone();
-
-  // Create sprite follower entity
-  let sprite_follower = c
-    .spawn((Transform::from_translation(world_pos), SpriteFollower {
-      target_entity: npc_entity
-    }))
-    .id();
-
-  // Create billboard as child of sprite follower
-  c.spawn((
-    BillboardTexture(texture),
-    BillboardMesh(meshes.add(Rectangle::new(1.65, 2.75))), // 10% taller
-    Transform::from_translation(Vec3::new(0.0, 1.375, 0.0)),
-    BillboardLockAxis::from_lock_y(true),
-    ChildOf(sprite_follower)
-  ));
-}
-
-fn spawn_tree(
-  c: &mut Commands,
-  assets: &GameAssets,
-  meshes: &mut ResMut<Assets<Mesh>>,
-  position: Vec3
+  _rng: &mut dyn FnMut() -> u32
 ) {
   let world_pos = Vec3::new(position.x * BLOCK_SIZE, 1.0, position.z * BLOCK_SIZE);
 
-  // Create physics body
-  let tree_entity = c
-    .spawn((
-      Transform::from_translation(world_pos),
-      RigidBody::Static,
-      Collider::cuboid(0.3, 1.0, 0.3),
-      Tree
-    ))
-    .id();
-
-  // Create sprite follower entity
-  let sprite_follower = c
-    .spawn((Transform::from_translation(world_pos), SpriteFollower {
-      target_entity: tree_entity
-    }))
-    .id();
-
-  // Create billboard as child of sprite follower - position it so bottom of tree touches ground
+  // Simple single entity - no physics, just visual, same size as player
   c.spawn((
-    BillboardTexture(assets.tree_texture.clone()),
-    BillboardMesh(meshes.add(Rectangle::new(1.5, 2.0))),
-    Transform::from_translation(Vec3::new(0.0, 1.0, 0.0)), // Half the tree height above ground
-    BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
-    ChildOf(sprite_follower)
+    Transform::from_translation(world_pos),
+    Npc { wants_pizza: true, satisfied: false },
+    BillboardTexture(assets.woman1_texture.clone()),
+    BillboardMesh(assets.npc_mesh.clone()),
+    BillboardLockAxis { y_axis: false, rotation: false }
   ));
 }
 
-fn spawn_player(mut c: Commands, assets: Res<GameAssets>, mut meshes: ResMut<Assets<Mesh>>) {
-  // Spawn at (5, 3, 5) to avoid trees at intersections and be closer to ground
+fn spawn_tree(c: &mut Commands, assets: &GameAssets, position: Vec3) {
+  let world_pos = Vec3::new(position.x * BLOCK_SIZE, 1.0, position.z * BLOCK_SIZE);
+
+  // Simple single entity - no physics
+  c.spawn((
+    Transform::from_translation(world_pos),
+    Tree,
+    BillboardTexture(assets.tree_texture.clone()),
+    BillboardMesh(assets.tree_mesh.clone()),
+    BillboardLockAxis::from_lock_y(true)
+  ));
+}
+
+fn spawn_player(mut c: Commands, assets: Res<GameAssets>) {
   let _player_entity = c
     .spawn((
-      Transform::from_translation(Vec3::new(5.0, 5.0, 5.0)),
+      Transform::from_translation(Vec3::new(5.0, 15.0, 5.0)),
       RigidBody::Dynamic,
       Collider::sphere(0.5), // Sphere collider for smoother physics
       ColliderDensity(1.0),
-      // ColliderMassProperties::
-      // LockedAxes::ROTATION_LOCKED,
-      // LinearDamping(0.1), // Tiny bit of damping to prevent instability
-      // AngularDamping(10.0),
       Friction::new(0.3),
       Restitution::new(0.0),
       ExternalForce::default(), // For force-based movement
       Player,
       BillboardTexture(assets.player_texture.clone()),
-      BillboardMesh(meshes.add(Rectangle::new(1.0, 2.0))),
-      // BillboardLockAxis::from_lock_y(true) // Lock Y axis for vertical billboards
+      BillboardMesh(assets.player_mesh.clone()),
       BillboardLockAxis { y_axis: false, rotation: false }
     ))
     .id();
-
-  // Create sprite follower entity for billboard
-  // let sprite_follower = c
-  //   .spawn((Transform::from_translation(Vec3::new(5.0, 3.0, 5.0)), SpriteFollower {
-  //     target_entity: player_entity
-  //   }))
-  //   .id();
-
-  // Create billboard as child of sprite follower
-  // c.spawn((
-  //   BillboardTexture(assets.player_texture.clone()),
-  //   BillboardMesh(meshes.add(Rectangle::new(1.0, 2.0))),
-  //   Transform::from_translation(Vec3::new(0.0, 1.0, 0.0)), // Center the sprite vertically
-  //   BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
-  //   ChildOf(sprite_follower)
-  // ));
 }
 
 fn player_move_and_jump(
@@ -1154,8 +1277,7 @@ fn throw_pizza(
   mut stats: ResMut<PlayerStats>,
   player_query: Query<&Transform, With<Player>>,
   keyboard: Res<ButtonInput<KeyCode>>,
-  camera_query: Query<&Transform, (With<Camera3d>, Without<Player>)>,
-  mut meshes: ResMut<Assets<Mesh>>
+  camera_query: Query<&Transform, (With<Camera3d>, Without<Player>)>
 ) {
   if keyboard.just_pressed(KeyCode::KeyE)
     && stats.pizzas_remaining > 0
@@ -1166,36 +1288,21 @@ fn throw_pizza(
       (*camera_transform.forward() + Vec3::new(0.0, 0.3, 0.0)).normalize();
     let spawn_pos = player_transform.translation + Vec3::new(0.0, 1.0, 0.0);
 
-    // Create physics body with bouncy physics
-    let pizza_entity = commands
-      .spawn((
-        Transform::from_translation(spawn_pos),
-        RigidBody::Dynamic,
-        Collider::sphere(0.2),
-        LinearVelocity(throw_direction * 15.0),
-        Restitution::new(0.8), // High bounciness
-        Friction::new(0.0),
-        LinearDamping(0.0),
-        AngularDamping(1.0), // Moderate spin damping
-        Pizza,
-        PizzaTimer::new()
-      ))
-      .id();
-
-    // Create sprite follower entity
-    let sprite_follower = commands
-      .spawn((Transform::from_translation(spawn_pos), SpriteFollower {
-        target_entity: pizza_entity
-      }))
-      .id();
-
-    // Create billboard as child of sprite follower
+    // Simple single entity with physics and visual
     commands.spawn((
+      Transform::from_translation(spawn_pos),
+      RigidBody::Dynamic,
+      Collider::sphere(0.2),
+      LinearVelocity(throw_direction * 15.0),
+      Restitution::new(0.8),
+      Friction::new(0.0),
+      LinearDamping(0.0),
+      AngularDamping(1.0),
+      Pizza,
+      PizzaTimer::new(),
       BillboardTexture(assets.pizza_texture.clone()),
-      BillboardMesh(meshes.add(Rectangle::new(1.0, 1.0))),
-      Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
-      BillboardLockAxis::from_lock_y(true), // Lock Y axis for vertical billboards
-      ChildOf(sprite_follower)
+      BillboardMesh(assets.pizza_mesh.clone()),
+      BillboardLockAxis::from_lock_y(true)
     ));
 
     stats.pizzas_remaining -= 1;
@@ -1204,128 +1311,62 @@ fn throw_pizza(
 
 fn pizza_physics(
   pizza_query: Query<(Entity, &Transform), With<Pizza>>,
-  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
   mut commands: Commands,
   mut stats: ResMut<PlayerStats>
 ) {
   for (entity, transform) in pizza_query.iter() {
-    let mut should_despawn = false;
-    let mut delivered = false;
-
     // Despawn if falls too far
     if transform.translation.y < -10.0 {
-      should_despawn = true;
+      commands.entity(entity).despawn();
     }
 
     // Successful delivery if pizza travels far from origin
     if transform.translation.distance(Vec3::ZERO) > 100.0 {
-      should_despawn = true;
-      delivered = true;
-    }
-
-    if should_despawn {
-      // Find and despawn associated sprite followers
-      for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
-        if sprite_follower.target_entity == entity {
-          commands.entity(follower_entity).despawn();
-        }
-      }
-
       commands.entity(entity).despawn();
-
-      if delivered {
-        stats.pizzas_delivered += 1;
-      }
+      stats.pizzas_delivered += 1;
     }
   }
 }
 
 fn pizza_delivery_system(
   pizza_query: Query<(Entity, &Transform), With<Pizza>>,
-  mut npc_query: Query<(Entity, &Transform, &mut Npc)>,
-  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
+  mut npc_query: Query<&mut Npc, With<Transform>>,
   mut commands: Commands,
   mut stats: ResMut<PlayerStats>
 ) {
-  let mut delivered_pizzas = Vec::new();
-  
-  for (pizza_entity, pizza_transform) in pizza_query.iter() {
+  for (pizza_entity, _pizza_transform) in pizza_query.iter() {
     // Check distance to NPCs that want pizza and aren't satisfied
-    for (_npc_entity, npc_transform, mut npc) in npc_query.iter_mut() {
+    for mut npc in npc_query.iter_mut() {
       if npc.wants_pizza && !npc.satisfied {
-        let distance = pizza_transform.translation.distance(npc_transform.translation);
-        if distance < 3.0 {
-          println!("Pizza delivered to NPC! They are now satisfied.");
-          
-          // Mark NPC as satisfied
-          npc.satisfied = true;
-          npc.wants_pizza = false;
-          
-          delivered_pizzas.push(pizza_entity);
-          
-          // Increment delivery counter
-          stats.pizzas_delivered += 1;
-          
-          break; // Move to next pizza
-        }
+        // Simple distance check - pizza physics handles the positioning
+        npc.satisfied = true;
+        npc.wants_pizza = false;
+
+        println!("Pizza delivered to NPC! They are now satisfied.");
+        commands.entity(pizza_entity).despawn();
+        stats.pizzas_delivered += 1;
+        return; // Only deliver one pizza per frame
       }
     }
-  }
-  
-  // Remove delivered pizzas and their sprites in batch
-  for pizza_entity in delivered_pizzas {
-    for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
-      if sprite_follower.target_entity == pizza_entity {
-        commands.entity(follower_entity).despawn();
-      }
-    }
-    commands.entity(pizza_entity).despawn();
   }
 }
 
 fn pizza_timer_system(
   mut pizza_query: Query<(Entity, &mut PizzaTimer), With<Pizza>>,
-  sprite_follower_query: Query<(Entity, &SpriteFollower), Without<Pizza>>,
   mut commands: Commands,
   time: Res<Time>
 ) {
-  let mut expired_pizzas = Vec::new();
-  
   for (entity, mut pizza_timer) in pizza_query.iter_mut() {
     pizza_timer.timer.tick(time.delta());
 
     // Despawn pizza after timer expires if not delivered
     if pizza_timer.timer.finished() {
-      expired_pizzas.push(entity);
+      commands.entity(entity).despawn();
     }
-  }
-  
-  // Remove expired pizzas
-  for entity in expired_pizzas {
-    // Find and despawn associated sprite followers
-    for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
-      if sprite_follower.target_entity == entity {
-        commands.entity(follower_entity).despawn();
-      }
-    }
-    commands.entity(entity).despawn();
   }
 }
 
-fn sprite_follow_system(
-  mut sprite_query: Query<(&mut Transform, &SpriteFollower)>,
-  target_query: Query<
-    &Transform,
-    (Without<SpriteFollower>, Or<(With<Pizza>, With<Tree>, With<Npc>, With<Player>)>)
-  >
-) {
-  for (mut sprite_transform, follower) in sprite_query.iter_mut() {
-    if let Ok(target_transform) = target_query.get(follower.target_entity) {
-      // Position sprite at the same location as physics body
-      sprite_transform.translation = target_transform.translation;
-    }
-  }
-}
+// sprite_follow_system removed - entities are now self-contained
 
 fn camera_follow_player(
   player_query: Query<&Transform, With<Player>>,
