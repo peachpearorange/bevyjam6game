@@ -117,7 +117,7 @@ impl VoxelWorldConfig for MyWorld {
 
   fn voxel_texture(&self) -> Option<(String, u32)> {
     // blocks.png texture with 10 different textures stacked vertically
-    Some(("blocks.png".into(), 10))
+    Some(("embedded://blocks.png".into(), 10))
   }
 }
 
@@ -150,13 +150,29 @@ struct CameraController {
   pitch: f32,
   yaw: f32
 }
-
+use bevy::render::{RenderPlugin,
+                   settings::{Backends, RenderCreation, WgpuSettings}};
 fn main() {
   App::new()
     .add_plugins(
       DefaultPlugins
         .set(AssetPlugin { meta_check: AssetMetaCheck::Never, ..default() })
         .set(ImagePlugin::default_nearest())
+        .set(WindowPlugin {
+          primary_window: Some(Window {
+            // resolution: WindowResolution
+            mode: bevy::window::WindowMode::Windowed,
+
+            present_mode: bevy::window::PresentMode::AutoVsync,
+            title: "bevy jam 6 game".to_string(),
+            canvas: Some("#bevy".to_string()),
+            ..default()
+          }),
+          ..default()
+        }) // .set(RenderPlugin {
+           //   render_creation:
+           //   wgpu_settings: WgpuSettings { backends: Some(Backends::DX12), ..default() }
+           // })
     )
     .add_plugins(EmbeddedAssetPlugin::default())
     .add_plugins(PhysicsPlugins::default())
@@ -195,11 +211,11 @@ fn setup_assets(
   mut meshes: ResMut<Assets<Mesh>>
 ) {
   // Don't load blocks_texture here since voxel world handles it
-  let player_texture = asset_server.load("guy.png");
-  let pizza_texture = asset_server.load("pizzabox.png");
-  let tree_texture = asset_server.load("tree.png");
-  let woman1_texture = asset_server.load("woman1.png");
-  let ducky_texture = asset_server.load("ducky.png");
+  let player_texture = asset_server.load("embedded://guy.png");
+  let pizza_texture = asset_server.load("embedded://pizzabox.png");
+  let tree_texture = asset_server.load("embedded://tree.png");
+  let woman1_texture = asset_server.load("embedded://woman1.png");
+  let ducky_texture = asset_server.load("embedded://ducky.png");
 
   // Remove texture atlas layout since voxel world handles textures
   let blocks_layout =
@@ -410,7 +426,7 @@ fn generate_complex_building(
     _ => BuildingShape::Stepped
   };
 
-  println!("Generating building: {:?} shape at ({}, {})", shape, start_x, start_z);
+  // println!("Generating building: {:?} shape at ({}, {})", shape, start_x, start_z);
 
   match shape {
     BuildingShape::Simple => generate_simple_building(
@@ -1080,7 +1096,7 @@ fn generate_city(
           if (rng() % 50) == 0 {
             let distance_from_center = ((x * x + z * z) as f32).sqrt();
             if distance_from_center < 200.0 && distance_from_center > 20.0 {
-              println!("Spawning NPC at ({}, {})", x, z);
+              // println!("Spawning NPC at ({}, {})", x, z);
               spawn_npc(
                 &mut commands,
                 &assets,
