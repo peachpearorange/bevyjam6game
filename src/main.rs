@@ -1334,22 +1334,25 @@ fn pizza_physics(
 
 fn pizza_delivery_system(
   pizza_query: Query<(Entity, &Transform), With<Pizza>>,
-  mut npc_query: Query<&mut Npc, With<Transform>>,
+  mut npc_query: Query<(&mut Npc, &Transform)>,
   mut commands: Commands,
   mut stats: ResMut<PlayerStats>
 ) {
-  for (pizza_entity, _pizza_transform) in pizza_query.iter() {
-    // Check distance to NPCs that want pizza and aren't satisfied
-    for mut npc in npc_query.iter_mut() {
+  for (pizza_entity, pizza_transform) in pizza_query.iter() {
+    for (mut npc, npc_transform) in npc_query.iter_mut() {
       if npc.wants_pizza && !npc.satisfied {
-        // Simple distance check - pizza physics handles the positioning
-        npc.satisfied = true;
-        npc.wants_pizza = false;
+        let distance = pizza_transform.translation.distance(npc_transform.translation);
+        
+        // Pizza must be close to NPC (within 2 units) to be delivered
+        if distance < 2.0 {
+          npc.satisfied = true;
+          npc.wants_pizza = false;
 
-        println!("Pizza delivered to NPC! They are now satisfied.");
-        commands.entity(pizza_entity).despawn();
-        stats.pizzas_delivered += 1;
-        return; // Only deliver one pizza per frame
+          println!("Pizza delivered to NPC at distance {:.2}! They are now satisfied.", distance);
+          commands.entity(pizza_entity).despawn();
+          stats.pizzas_delivered += 1;
+          return; // Only deliver one pizza per frame
+        }
       }
     }
   }
