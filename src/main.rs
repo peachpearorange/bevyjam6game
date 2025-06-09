@@ -78,7 +78,7 @@ struct PizzaTimer {
 }
 
 impl PizzaTimer {
-  fn new() -> Self { Self { timer: Timer::from_seconds(3.0, TimerMode::Once) } }
+  fn new() -> Self { Self { timer: Timer::from_seconds(5.0, TimerMode::Once) } }
 }
 
 #[derive(Component)]
@@ -212,7 +212,7 @@ fn setup_assets(
   let npc_mesh = meshes.add(Rectangle::new(1.0, 2.0));
   let player_mesh = meshes.add(Rectangle::new(1.0, 2.0));
   let tree_mesh = meshes.add(Rectangle::new(1.5, 2.0));
-  let pizza_mesh = meshes.add(Rectangle::new(1.0, 1.0));
+  let pizza_mesh = meshes.add(Rectangle::new(0.8, 0.8)); // Slightly smaller for visibility
 
   commands.insert_resource(GameAssets {
     player_texture,
@@ -680,9 +680,9 @@ fn generate_l_shaped_building(
   // Build wing 2 (vertical bar)
   for bx in start_x..(start_x + wing2_width) {
     for bz in wing2_start_z..(wing2_start_z + wing2_depth) {
-      if !occupied.contains_key(&(bx, bz)) {
+      if let std::collections::hash_map::Entry::Vacant(e) = occupied.entry((bx, bz)) {
         // Don't override existing blocks
-        occupied.insert((bx, bz), true);
+        e.insert(true);
         for y in 1..=height {
           let is_edge = bx == start_x
             || bx == start_x + wing2_width - 1
@@ -799,8 +799,8 @@ fn generate_cross_building(
   // Build vertical bar
   for bx in v_start_x..(v_start_x + arm_width) {
     for bz in v_start_z..(v_start_z + depth) {
-      if !occupied.contains_key(&(bx, bz)) {
-        occupied.insert((bx, bz), true);
+      if let std::collections::hash_map::Entry::Vacant(e) = occupied.entry((bx, bz)) {
+        e.insert(true);
         for y in 1..=height {
           let is_edge = bx == v_start_x
             || bx == v_start_x + arm_width - 1
@@ -1138,7 +1138,7 @@ fn spawn_npc(
   position: Vec3,
   _rng: &mut dyn FnMut() -> u32
 ) {
-  let world_pos = Vec3::new(position.x * BLOCK_SIZE, 1.0, position.z * BLOCK_SIZE);
+  let world_pos = Vec3::new(position.x * BLOCK_SIZE, 2.0, position.z * BLOCK_SIZE); // Raised to 2.0 for better visibility
 
   // Simple single entity - no physics, just visual, same size as player
   c.spawn((
@@ -1288,7 +1288,11 @@ fn throw_pizza(
       (*camera_transform.forward() + Vec3::new(0.0, 0.3, 0.0)).normalize();
     let spawn_pos = player_transform.translation + Vec3::new(0.0, 1.0, 0.0);
 
-    // Simple single entity with physics and visual
+    // Simple single entity using same approach as NPCs - just visual billboard with physics
+    println!(
+      "Throwing pizza at position: {:?} with direction: {:?}",
+      spawn_pos, throw_direction
+    );
     commands.spawn((
       Transform::from_translation(spawn_pos),
       RigidBody::Dynamic,
@@ -1302,7 +1306,7 @@ fn throw_pizza(
       PizzaTimer::new(),
       BillboardTexture(assets.pizza_texture.clone()),
       BillboardMesh(assets.pizza_mesh.clone()),
-      BillboardLockAxis::from_lock_y(true)
+      BillboardLockAxis { y_axis: false, rotation: false }
     ));
 
     stats.pizzas_remaining -= 1;
