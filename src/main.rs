@@ -1342,13 +1342,16 @@ fn pizza_delivery_system(
     for (mut npc, npc_transform) in npc_query.iter_mut() {
       if npc.wants_pizza && !npc.satisfied {
         let distance = pizza_transform.translation.distance(npc_transform.translation);
-        
+
         // Pizza must be close to NPC (within 2 units) to be delivered
         if distance < 2.0 {
           npc.satisfied = true;
           npc.wants_pizza = false;
 
-          println!("Pizza delivered to NPC at distance {:.2}! They are now satisfied.", distance);
+          println!(
+            "Pizza delivered to NPC at distance {:.2}! They are now satisfied.",
+            distance
+          );
           commands.entity(pizza_entity).despawn();
           stats.pizzas_delivered += 1;
           return; // Only deliver one pizza per frame
