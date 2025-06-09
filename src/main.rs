@@ -33,6 +33,24 @@ enum BlockType {
   GrayBricks
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildingType {
+  Residential,
+  Commercial,
+  Industrial,
+  Office,
+  Mixed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistrictType {
+  Downtown,
+  Residential,
+  Industrial,
+  Commercial,
+  Park
+}
+
 impl BlockType {
   const TEXTURE_SIZE: u32 = 16;
   const SIDE_LENGTH_PIXELS: u32 = 10;
@@ -40,10 +58,13 @@ impl BlockType {
   fn get_texture_atlas_index(self) -> usize { self.texture_coords() as usize }
 }
 
-const CITY_SIZE: i32 = 100;
+const CITY_SIZE: i32 = 120;
 const BLOCK_SIZE: f32 = 1.0;
-const BUILDING_HEIGHT_MIN: i32 = 15;
-const BUILDING_HEIGHT_MAX: i32 = 25;
+const BUILDING_HEIGHT_MIN: i32 = 5;
+const BUILDING_HEIGHT_MAX: i32 = 35;
+const MAIN_ROAD_WIDTH: i32 = 3;
+const SIDE_ROAD_WIDTH: i32 = 1;
+const DISTRICT_SIZE: i32 = 40;
 
 #[derive(Component)]
 struct Player;
@@ -71,7 +92,8 @@ struct Tree;
 
 #[derive(Component)]
 struct Npc {
-  wants_pizza: bool
+  wants_pizza: bool,
+  satisfied: bool
 }
 
 // Component to link sprites to their physics bodies
@@ -140,7 +162,7 @@ fn main() {
     .add_plugins(PhysicsPlugins::default())
     .add_plugins(VoxelWorldPlugin::with_config(MyWorld))
     .add_plugins(BillboardPlugin)
-    .insert_resource(PlayerStats { pizzas_delivered: 0, pizzas_remaining: 10 })
+    .insert_resource(PlayerStats { pizzas_delivered: 0, pizzas_remaining: 20 })
     .add_systems(
       Startup,
       (setup_assets, setup_camera, setup_voxel_world, generate_city, spawn_player).chain()
@@ -148,8 +170,9 @@ fn main() {
     .add_systems(
       Update,
       (
-        player_movement,
-        player_jump,
+        // player_movement,
+        // player_jump,
+        player_move_and_jump,
         throw_pizza,
         pizza_physics,
         pizza_timer_system,
@@ -218,6 +241,573 @@ fn setup_voxel_world() {
   // Voxel world is automatically set up by the plugin
 }
 
+fn get_district_type(x: i32, z: i32) -> DistrictType {
+  let district_x = x / DISTRICT_SIZE;
+  let district_z = z / DISTRICT_SIZE;
+
+  // Create a deterministic pattern based on district coordinates
+  let pattern = (district_x + district_z * 3).abs() % 5;
+  match pattern {
+    0 => DistrictType::Downtown,
+    1 => DistrictType::Residential,
+    2 => DistrictType::Commercial,
+    3 => DistrictType::Industrial,
+    _ => DistrictType::Park
+  }
+}
+
+fn get_building_type_for_district(
+  district: DistrictType,
+  rng: &mut dyn FnMut() -> u32
+) -> BuildingType {
+  match district {
+    DistrictType::Downtown => match rng() % 3 {
+      0 => BuildingType::Office,
+      1 => BuildingType::Commercial,
+      _ => BuildingType::Mixed
+    },
+    DistrictType::Residential => BuildingType::Residential,
+    DistrictType::Commercial => BuildingType::Commercial,
+    DistrictType::Industrial => BuildingType::Industrial,
+    DistrictType::Park => BuildingType::Residential // Sparse low buildings
+  }
+}
+
+fn get_building_params(
+  building_type: BuildingType,
+  district: DistrictType,
+  rng: &mut dyn FnMut() -> u32
+) -> (i32, i32, i32, f32) {
+  match building_type {
+    BuildingType::Residential => {
+      let width = 4 + (rng() % 6) as i32; // 4-9 blocks
+      let depth = 4 + (rng() % 6) as i32;
+      let height = match district {
+        DistrictType::Downtown => 15 + (rng() % 15) as i32, // 15-29 floors
+        DistrictType::Park => 3 + (rng() % 4) as i32,       // 3-6 floors
+        _ => 8 + (rng() % 12) as i32                        // 8-19 floors
+      };
+      (width, depth, height, 0.8) // 80% spawn chance
+    }
+    BuildingType::Commercial => {
+      let width = 6 + (rng() % 10) as i32; // 6-15 blocks  
+      let depth = 6 + (rng() % 10) as i32;
+      let height = match district {
+        DistrictType::Downtown => 20 + (rng() % 15) as i32, // 20-34 floors
+        _ => 5 + (rng() % 10) as i32                        // 5-14 floors
+      };
+      (width, depth, height, 0.9) // 90% spawn chance
+    }
+    BuildingType::Industrial => {
+      let width = 8 + (rng() % 15) as i32; // 8-22 blocks
+      let depth = 8 + (rng() % 15) as i32;
+      let height = 3 + (rng() % 6) as i32; // 3-8 floors (low and wide)
+      (width, depth, height, 0.7) // 70% spawn chance
+    }
+    BuildingType::Office => {
+      let width = 5 + (rng() % 8) as i32; // 5-12 blocks
+      let depth = 5 + (rng() % 8) as i32;
+      let height = match district {
+        DistrictType::Downtown => 25 + (rng() % 10) as i32, // 25-34 floors (skyscrapers)
+        _ => 12 + (rng() % 15) as i32                       // 12-26 floors
+      };
+      (width, depth, height, 0.85) // 85% spawn chance
+    }
+    BuildingType::Mixed => {
+      let width = 5 + (rng() % 8) as i32;
+      let depth = 5 + (rng() % 8) as i32;
+      let height = 10 + (rng() % 20) as i32; // 10-29 floors
+      (width, depth, height, 0.9) // 90% spawn chance
+    }
+  }
+}
+
+fn is_main_road(x: i32, z: i32) -> bool {
+  // Major arterials every 30 blocks
+  (x % 30 == 0) || (z % 30 == 0) ||
+  // Secondary roads every 15 blocks
+  (x % 15 == 0) || (z % 15 == 0)
+}
+
+fn get_road_width(x: i32, z: i32) -> i32 {
+  if (x % 30 == 0) || (z % 30 == 0) { MAIN_ROAD_WIDTH } else { SIDE_ROAD_WIDTH }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BuildingShape {
+  Simple,
+  Tower,
+  Stepped,
+  LShape,
+  Courtyard,
+  CrossShape,
+  TShape,
+  MultipleTowers,
+  Curved,
+  Ziggurat
+}
+
+fn place_building_block(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  x: i32,
+  y: i32,
+  z: i32,
+  building_type: BuildingType,
+  is_edge: bool,
+  is_top: bool,
+  rng: &mut dyn FnMut() -> u32
+) {
+  let block_type = if is_top {
+    BlockType::Roof
+  } else if y == 1 && is_edge && (rng() % 8) == 0 {
+    BlockType::Door
+  } else if is_edge && (rng() % 3) == 0 {
+    BlockType::Window
+  } else if is_edge {
+    match building_type {
+      BuildingType::Industrial => BlockType::GrayBricks,
+      BuildingType::Residential => {
+        if (rng() % 2) == 0 {
+          BlockType::RedBricks
+        } else {
+          BlockType::Building
+        }
+      }
+      _ => BlockType::Building
+    }
+  } else {
+    BlockType::Building
+  };
+
+  voxel_world.set_voxel(
+    IVec3::new(x, y, z),
+    WorldVoxel::Solid(block_type.texture_coords() as u8)
+  );
+}
+
+fn generate_complex_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Test with just a few shapes to debug
+  let shape = match rng() % 5 {
+    0 => BuildingShape::Simple,
+    1 => BuildingShape::Tower,
+    2 => BuildingShape::LShape,
+    3 => BuildingShape::CrossShape,
+    _ => BuildingShape::Stepped
+  };
+
+  println!("Generating building: {:?} shape at ({}, {})", shape, start_x, start_z);
+  
+  match shape {
+    BuildingShape::Simple => generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::Tower => generate_tower_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::Stepped => generate_stepped_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::LShape => generate_l_shaped_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::Courtyard => generate_courtyard_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::CrossShape => generate_cross_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::TShape => generate_t_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::MultipleTowers => generate_multiple_towers_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::Curved => generate_curved_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng),
+    BuildingShape::Ziggurat => generate_ziggurat_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng)
+  }
+}
+
+fn generate_simple_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  for bx in start_x..(start_x + width) {
+    for bz in start_z..(start_z + depth) {
+      occupied.insert((bx, bz), true);
+      
+      for y in 1..=height {
+        let is_edge = bx == start_x || bx == start_x + width - 1 ||
+                     bz == start_z || bz == start_z + depth - 1;
+        let is_top = y == height;
+        
+        place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+      }
+    }
+  }
+}
+
+fn generate_tower_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Base building (70% of height)
+  let base_height = (height as f32 * 0.7) as i32;
+  generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, base_height, building_type, rng);
+  
+  // Tower section (smaller, centered)
+  let tower_width = width / 2 + 1;
+  let tower_depth = depth / 2 + 1;
+  let tower_start_x = start_x + (width - tower_width) / 2;
+  let tower_start_z = start_z + (depth - tower_depth) / 2;
+  
+  for bx in tower_start_x..(tower_start_x + tower_width) {
+    for bz in tower_start_z..(tower_start_z + tower_depth) {
+      for y in (base_height + 1)..=height {
+        let is_edge = bx == tower_start_x || bx == tower_start_x + tower_width - 1 ||
+                     bz == tower_start_z || bz == tower_start_z + tower_depth - 1;
+        let is_top = y == height;
+        
+        place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+      }
+    }
+  }
+}
+
+fn generate_stepped_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  let steps = 3.min(height / 4);
+  let step_height = height / (steps + 1);
+  
+  for step in 0..=steps {
+    let step_shrink = step * 2;
+    let step_width = (width - step_shrink).max(3);
+    let step_depth = (depth - step_shrink).max(3);
+    let step_start_x = start_x + step_shrink / 2;
+    let step_start_z = start_z + step_shrink / 2;
+    let step_max_height = height - (step * step_height);
+    let step_min_height = if step == 0 { 1 } else { height - ((step - 1) * step_height) + 1 };
+    
+    for bx in step_start_x..(step_start_x + step_width) {
+      for bz in step_start_z..(step_start_z + step_depth) {
+        if step == 0 {
+          occupied.insert((bx, bz), true);
+        }
+        
+        for y in step_min_height..=step_max_height {
+          let is_edge = bx == step_start_x || bx == step_start_x + step_width - 1 ||
+                       bz == step_start_z || bz == step_start_z + step_depth - 1;
+          let is_top = y == step_max_height;
+          
+          place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+        }
+      }
+    }
+  }
+}
+
+fn generate_l_shaped_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Create L-shape directly without recursion
+  let wing1_width = width;
+  let wing1_depth = depth / 2 + 1;
+  let wing2_width = width / 2 + 1;
+  let wing2_depth = depth - wing1_depth;
+  let wing2_start_z = start_z + wing1_depth;
+  
+  // Build wing 1 (horizontal bar)
+  for bx in start_x..(start_x + wing1_width) {
+    for bz in start_z..(start_z + wing1_depth) {
+      occupied.insert((bx, bz), true);
+      for y in 1..=height {
+        let is_edge = bx == start_x || bx == start_x + wing1_width - 1 ||
+                     bz == start_z || bz == start_z + wing1_depth - 1;
+        let is_top = y == height;
+        place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+      }
+    }
+  }
+  
+  // Build wing 2 (vertical bar)
+  for bx in start_x..(start_x + wing2_width) {
+    for bz in wing2_start_z..(wing2_start_z + wing2_depth) {
+      if !occupied.contains_key(&(bx, bz)) { // Don't override existing blocks
+        occupied.insert((bx, bz), true);
+        for y in 1..=height {
+          let is_edge = bx == start_x || bx == start_x + wing2_width - 1 ||
+                       bz == wing2_start_z || bz == wing2_start_z + wing2_depth - 1;
+          let is_top = y == height;
+          place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+        }
+      }
+    }
+  }
+}
+
+fn generate_courtyard_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Only create courtyard if building is large enough
+  if width < 8 || depth < 8 {
+    generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, height, building_type, rng);
+    return;
+  }
+  
+  // Courtyard dimensions (inner empty space)
+  let courtyard_width = width / 3;
+  let courtyard_depth = depth / 3;
+  let courtyard_start_x = start_x + (width - courtyard_width) / 2;
+  let courtyard_start_z = start_z + (depth - courtyard_depth) / 2;
+  
+  for bx in start_x..(start_x + width) {
+    for bz in start_z..(start_z + depth) {
+      // Skip courtyard area
+      if bx >= courtyard_start_x && bx < courtyard_start_x + courtyard_width &&
+         bz >= courtyard_start_z && bz < courtyard_start_z + courtyard_depth {
+        continue;
+      }
+      
+      occupied.insert((bx, bz), true);
+      
+      for y in 1..=height {
+        let is_edge = bx == start_x || bx == start_x + width - 1 ||
+                     bz == start_z || bz == start_z + depth - 1 ||
+                     bx == courtyard_start_x - 1 || bx == courtyard_start_x + courtyard_width ||
+                     bz == courtyard_start_z - 1 || bz == courtyard_start_z + courtyard_depth;
+        let is_top = y == height;
+        
+        place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+      }
+    }
+  }
+}
+
+fn generate_cross_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  let arm_width = width / 3;
+  let arm_depth = depth / 3;
+  
+  // Horizontal bar
+  let h_start_x = start_x;
+  let h_start_z = start_z + depth / 2 - arm_depth / 2;
+  
+  // Vertical bar
+  let v_start_x = start_x + width / 2 - arm_width / 2;
+  let v_start_z = start_z;
+  
+  // Build horizontal bar
+  for bx in h_start_x..(h_start_x + width) {
+    for bz in h_start_z..(h_start_z + arm_depth) {
+      occupied.insert((bx, bz), true);
+      for y in 1..=height {
+        let is_edge = bx == h_start_x || bx == h_start_x + width - 1 ||
+                     bz == h_start_z || bz == h_start_z + arm_depth - 1;
+        let is_top = y == height;
+        place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+      }
+    }
+  }
+  
+  // Build vertical bar
+  for bx in v_start_x..(v_start_x + arm_width) {
+    for bz in v_start_z..(v_start_z + depth) {
+      if !occupied.contains_key(&(bx, bz)) {
+        occupied.insert((bx, bz), true);
+        for y in 1..=height {
+          let is_edge = bx == v_start_x || bx == v_start_x + arm_width - 1 ||
+                       bz == v_start_z || bz == v_start_z + depth - 1;
+          let is_top = y == height;
+          place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+        }
+      }
+    }
+  }
+}
+
+fn generate_t_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Top horizontal bar
+  let bar_depth = depth / 3;
+  generate_simple_building(voxel_world, occupied, start_x, start_z, width, bar_depth, height, building_type, rng);
+  
+  // Vertical stem
+  let stem_width = width / 3;
+  let stem_start_x = start_x + width / 2 - stem_width / 2;
+  let stem_start_z = start_z + bar_depth;
+  let stem_depth = depth - bar_depth;
+  generate_simple_building(voxel_world, occupied, stem_start_x, stem_start_z, stem_width, stem_depth, height, building_type, rng);
+}
+
+fn generate_multiple_towers_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Base platform
+  let base_height = height / 3;
+  generate_simple_building(voxel_world, occupied, start_x, start_z, width, depth, base_height, building_type, rng);
+  
+  // Multiple towers on the base
+  let tower_size = (width.min(depth)) / 3;
+  let positions = [
+    (start_x + 1, start_z + 1),
+    (start_x + width - tower_size - 1, start_z + 1),
+    (start_x + 1, start_z + depth - tower_size - 1),
+    (start_x + width - tower_size - 1, start_z + depth - tower_size - 1),
+  ];
+  
+  for (tx, tz) in positions.iter() {
+    if *tx >= start_x && *tz >= start_z && *tx + tower_size <= start_x + width && *tz + tower_size <= start_z + depth {
+      let tower_height = base_height + (height - base_height) * (3 + (rng() % 3) as i32) / 4;
+      for bx in *tx..(*tx + tower_size) {
+        for bz in *tz..(*tz + tower_size) {
+          for y in (base_height + 1)..=tower_height {
+            let is_edge = bx == *tx || bx == *tx + tower_size - 1 ||
+                         bz == *tz || bz == *tz + tower_size - 1;
+            let is_top = y == tower_height;
+            place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+          }
+        }
+      }
+    }
+  }
+}
+
+fn generate_curved_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // Create a curved building using an arc approximation
+  let center_x = start_x + width / 2;
+  let center_z = start_z + depth / 2;
+  let radius = width.min(depth) as f32 / 2.0 - 1.0;
+  
+  for bx in start_x..(start_x + width) {
+    for bz in start_z..(start_z + depth) {
+      let dx = (bx - center_x) as f32;
+      let dz = (bz - center_z) as f32;
+      let distance = (dx * dx + dz * dz).sqrt();
+      
+      // Create a ring-shaped building (curved walls with hollow center)
+      if distance >= radius - 2.0 && distance <= radius + 1.0 {
+        occupied.insert((bx, bz), true);
+        
+        for y in 1..=height {
+          let is_edge = distance >= radius + 0.5 || distance <= radius - 1.5;
+          let is_top = y == height;
+          place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+        }
+      }
+    }
+  }
+}
+
+fn generate_ziggurat_building(
+  voxel_world: &mut VoxelWorld<MyWorld>,
+  occupied: &mut std::collections::HashMap<(i32, i32), bool>,
+  start_x: i32,
+  start_z: i32,
+  width: i32,
+  depth: i32,
+  height: i32,
+  building_type: BuildingType,
+  rng: &mut dyn FnMut() -> u32
+) {
+  // More dramatic stepped pyramid with multiple levels
+  let levels = 5.min(height / 3);
+  let level_height = height / levels;
+  
+  for level in 0..levels {
+    let shrink = level * 2;
+    let level_width = (width - shrink).max(3);
+    let level_depth = (depth - shrink).max(3);
+    let level_start_x = start_x + shrink / 2;
+    let level_start_z = start_z + shrink / 2;
+    let level_bottom = level * level_height + 1;
+    let level_top = (level + 1) * level_height;
+    
+    for bx in level_start_x..(level_start_x + level_width) {
+      for bz in level_start_z..(level_start_z + level_depth) {
+        if level == 0 {
+          occupied.insert((bx, bz), true);
+        }
+        
+        for y in level_bottom..=level_top {
+          let is_edge = bx == level_start_x || bx == level_start_x + level_width - 1 ||
+                       bz == level_start_z || bz == level_start_z + level_depth - 1;
+          let is_top = y == level_top;
+          
+          place_building_block(voxel_world, bx, y, bz, building_type, is_edge, is_top, rng);
+        }
+      }
+    }
+  }
+}
+
 fn generate_city(
   mut voxel_world: VoxelWorld<MyWorld>,
   mut commands: Commands,
@@ -233,22 +823,33 @@ fn generate_city(
   };
 
   let mut occupied = HashMap::new();
-  let block_size = 20; // Size of each city block (building + space)
 
-  // First pass: generate roads and sidewalks
+  // First pass: generate sophisticated road network
   for x in -CITY_SIZE..CITY_SIZE {
     for z in -CITY_SIZE..CITY_SIZE {
-      let is_road = (x % block_size == 0) || (z % block_size == 0);
+      let road_width = get_road_width(x, z);
+      let mut is_road = false;
+
+      // Check if this position is within road width of any road line
+      for offset in -(road_width / 2)..=(road_width / 2) {
+        if is_main_road(x + offset, z) || is_main_road(x, z + offset) {
+          is_road = true;
+          break;
+        }
+      }
 
       if is_road {
         voxel_world.set_voxel(
           IVec3::new(x, 0, z),
           WorldVoxel::Solid(BlockType::Road.texture_coords() as u8)
         );
+        occupied.insert((x, z), true);
 
-        if x % block_size == 0 && z % block_size == 0 {
+        // Place trees at major intersections in park districts
+        let district = get_district_type(x, z);
+        if (x % 30 == 0 && z % 30 == 0) && district == DistrictType::Park {
           let distance_from_center = ((x * x + z * z) as f32).sqrt();
-          if distance_from_center < 30.0 {
+          if distance_from_center < 50.0 && (rng() % 3) == 0 {
             spawn_tree(
               &mut commands,
               &assets,
@@ -258,78 +859,89 @@ fn generate_city(
           }
         }
       } else {
-        voxel_world.set_voxel(
-          IVec3::new(x, 0, z),
-          WorldVoxel::Solid(BlockType::Sidewalk.texture_coords() as u8)
-        );
-
-        // Spawn NPCs on sidewalks occasionally
-        if (rng() % 100) == 0 {
-          let distance_from_center = ((x * x + z * z) as f32).sqrt();
-          if distance_from_center < 80.0 && distance_from_center > 10.0 {
-            spawn_npc(
-              &mut commands,
-              &assets,
-              &mut meshes,
-              Vec3::new(x as f32, 0.0, z as f32),
-              &mut rng
-            );
-          }
-        }
-      }
-    }
-  }
-
-  // Second pass: generate buildings in plots
-  for block_x in (-CITY_SIZE / block_size)..(CITY_SIZE / block_size) {
-    for block_z in (-CITY_SIZE / block_size)..(CITY_SIZE / block_size) {
-      let center_x = block_x * block_size + block_size / 2;
-      let center_z = block_z * block_size + block_size / 2;
-      let distance_from_center = ((center_x * center_x + center_z * center_z) as f32).sqrt();
-
-      if distance_from_center < 35.0 && (rng() % 100) < 60 {
-        // Generate a building of random size within the plot
-        let building_width = 3 + (rng() % 8) as i32; // 3-10 blocks wide
-        let building_depth = 3 + (rng() % 8) as i32; // 3-10 blocks deep
-        let building_height = BUILDING_HEIGHT_MIN
-          + ((rng() % (BUILDING_HEIGHT_MAX - BUILDING_HEIGHT_MIN) as u32) as i32);
-
-        // Center the building in the plot with some spacing
-        let start_x = center_x - building_width / 2;
-        let start_z = center_z - building_depth / 2;
-
-        // Ensure building doesn't go into roads (leave 2 block buffer)
-        let min_x = block_x * block_size + 2;
-        let max_x = (block_x + 1) * block_size - 2;
-        let min_z = block_z * block_size + 2;
-        let max_z = (block_z + 1) * block_size - 2;
-
-        for bx in start_x.max(min_x)..(start_x + building_width).min(max_x) {
-          for bz in start_z.max(min_z)..(start_z + building_depth).min(max_z) {
-            if let std::collections::hash_map::Entry::Vacant(e) = occupied.entry((bx, bz)) {
-              e.insert(true);
-
-              for y in 1..=building_height {
-                let block_type = if y == building_height {
-                  BlockType::Roof
-                } else if y == 1 && (bx == start_x || bz == start_z) && (rng() % 6) == 0 {
-                  BlockType::Door
-                } else if (rng() % 4) == 0 {
-                  BlockType::Window
-                } else {
-                  BlockType::Building
-                };
-                voxel_world.set_voxel(
-                  IVec3::new(bx, y, bz),
-                  WorldVoxel::Solid(block_type.texture_coords() as u8)
-                );
+        // Place sidewalks adjacent to roads
+        let is_sidewalk = {
+          let mut near_road = false;
+          for dx in -2..=2 {
+            for dz in -2..=2 {
+              if dx == 0 && dz == 0 {
+                continue;
+              }
+              let check_x = x + dx;
+              let check_z = z + dz;
+              if is_main_road(check_x, check_z) {
+                near_road = true;
+                break;
               }
             }
+            if near_road {
+              break;
+            }
           }
+          near_road
+        };
+
+        if is_sidewalk {
+          voxel_world.set_voxel(
+            IVec3::new(x, 0, z),
+            WorldVoxel::Solid(BlockType::Sidewalk.texture_coords() as u8)
+          );
+
+          // Spawn NPCs on sidewalks in populated districts
+          let district = get_district_type(x, z);
+          if matches!(district, DistrictType::Downtown | DistrictType::Commercial)
+            && (rng() % 200) == 0
+          {
+            let distance_from_center = ((x * x + z * z) as f32).sqrt();
+            if distance_from_center < 100.0 && distance_from_center > 15.0 {
+              spawn_npc(
+                &mut commands,
+                &assets,
+                &mut meshes,
+                Vec3::new(x as f32, 0.0, z as f32),
+                &mut rng
+              );
+            }
+          }
+        } else {
+          voxel_world.set_voxel(
+            IVec3::new(x, 0, z),
+            WorldVoxel::Solid(BlockType::Grass.texture_coords() as u8)
+          );
         }
       }
     }
   }
+
+  // Second pass: simple building generation
+  let mut buildings_placed = 0;
+  
+  // Place buildings on a simple grid
+  for x in (-50..50).step_by(12) {
+    for z in (-50..50).step_by(12) {
+      // Skip some randomly for variety
+      if (rng() % 100) < 20 { continue; }
+      
+      let building_type = get_building_type_for_district(DistrictType::Downtown, &mut rng);
+      let width = 4 + (rng() % 6) as i32;
+      let depth = 4 + (rng() % 6) as i32; 
+      let height = 8 + (rng() % 15) as i32;
+      
+      generate_complex_building(
+        &mut voxel_world,
+        &mut occupied,
+        x,
+        z,
+        width,
+        depth,
+        height,
+        building_type,
+        &mut rng
+      );
+      buildings_placed += 1;
+    }
+  }
+  println!("City generation complete: placed {} buildings", buildings_placed);
 }
 
 fn spawn_npc(
@@ -347,16 +959,12 @@ fn spawn_npc(
       Transform::from_translation(world_pos),
       RigidBody::Static,
       Collider::capsule(0.3, 0.8),
-      Npc { wants_pizza: (rng() % 3) == 0 } // 1/3 chance of wanting pizza
+      Npc { wants_pizza: true, satisfied: false }
     ))
     .id();
 
-  // Choose random NPC texture
-  let texture = if (rng() % 2) == 0 {
-    assets.woman1_texture.clone()
-  } else {
-    assets.ducky_texture.clone()
-  };
+  // Use woman1 texture for all NPCs
+  let texture = assets.woman1_texture.clone();
 
   // Create sprite follower entity
   let sprite_follower = c
@@ -412,9 +1020,9 @@ fn spawn_tree(
 
 fn spawn_player(mut c: Commands, assets: Res<GameAssets>, mut meshes: ResMut<Assets<Mesh>>) {
   // Spawn at (5, 3, 5) to avoid trees at intersections and be closer to ground
-  let player_entity = c
+  let _player_entity = c
     .spawn((
-      Transform::from_translation(Vec3::new(5.0, 70.0, 5.0)),
+      Transform::from_translation(Vec3::new(5.0, 5.0, 5.0)),
       RigidBody::Dynamic,
       Collider::sphere(0.5), // Sphere collider for smoother physics
       ColliderDensity(1.0),
@@ -422,13 +1030,14 @@ fn spawn_player(mut c: Commands, assets: Res<GameAssets>, mut meshes: ResMut<Ass
       // LockedAxes::ROTATION_LOCKED,
       // LinearDamping(0.1), // Tiny bit of damping to prevent instability
       // AngularDamping(10.0),
-      Friction::new(0.0),    // No physics friction - we implement our own
-      Restitution::new(0.0), // No bounciness for player
+      Friction::new(0.3),
+      Restitution::new(0.0),
       ExternalForce::default(), // For force-based movement
       Player,
       BillboardTexture(assets.player_texture.clone()),
       BillboardMesh(meshes.add(Rectangle::new(1.0, 2.0))),
-      BillboardLockAxis::from_lock_y(true) // Lock Y axis for vertical billboards
+      // BillboardLockAxis::from_lock_y(true) // Lock Y axis for vertical billboards
+      BillboardLockAxis { y_axis: false, rotation: false }
     ))
     .id();
 
@@ -449,41 +1058,42 @@ fn spawn_player(mut c: Commands, assets: Res<GameAssets>, mut meshes: ResMut<Ass
   // ));
 }
 
-fn player_movement(
-  mut player_query: Query<(&mut ExternalForce, &LinearVelocity, Entity), With<Player>>,
-  player_transform_query: Query<&Transform, With<Player>>,
+fn player_move_and_jump(
+  mut player_query: Query<
+    (&mut ExternalForce, &mut LinearVelocity, &Transform, Entity),
+    With<Player>
+  >,
   camera_query: Query<&Transform, With<Camera3d>>,
   keyboard: Res<ButtonInput<KeyCode>>,
   spatial_query: SpatialQuery
 ) {
-  if let (
-    Ok((mut external_force, velocity, player_entity)),
-    Ok(player_transform),
-    Ok(camera_transform)
-  ) = (player_query.single_mut(), player_transform_query.single(), camera_query.single())
+  // Grab the single player tuple and the camera transform
+  if let (Ok((mut ext_force, mut vel, player_tf, player_ent)), Ok(camera_tf)) =
+    (player_query.single_mut(), camera_query.single())
   {
-    // not persistent
-    external_force.persistent = false;
+    /* ---------- 1. movement ---------- */
 
-    // Check if player is on ground
-    // Player sphere collider has radius 0.5, so cast from bottom of sphere down
-    let ray_origin = player_transform.translation;
+    // ExternalForce should only last one frame
+    ext_force.persistent = false;
+
+    // Ground check (sphere-cast down a little)
+    let ray_origin = player_tf.translation;
     let ray_direction = Dir3::NEG_Y;
-    let max_distance = 0.7; // Short distance to detect very close ground
-    let filter = SpatialQueryFilter::default().with_excluded_entities([player_entity]);
-    let raycast_result =
-      spatial_query.cast_ray(ray_origin, ray_direction, max_distance, true, &filter);
-    let is_grounded = raycast_result.is_some() || true;
+    let max_distance = 0.7;
+    let filter = SpatialQueryFilter::default().with_excluded_entities([player_ent]);
 
-    // Get input direction
-    let camera_forward = camera_transform.forward().normalize();
-    let camera_right = camera_transform.right().normalize();
-    let forward = Vec3::new(camera_forward.x, 0.0, camera_forward.z).normalize();
-    let right = Vec3::new(camera_right.x, 0.0, camera_right.z).normalize();
+    let is_grounded = spatial_query
+      .cast_ray(ray_origin, ray_direction, max_distance, true, &filter)
+      .is_some(); // ← remove the old “|| true” debug hack
 
+    // Camera-relative axes, flattened to X-Z
+    let cam_fwd = camera_tf.forward().normalize();
+    let cam_right = camera_tf.right().normalize();
+    let forward = Vec3::new(cam_fwd.x, 0.0, cam_fwd.z).normalize();
+    let right = Vec3::new(cam_right.x, 0.0, cam_right.z).normalize();
 
-    let direction = [
-      // (key, contribution)
+    // Direction from WASD / arrows
+    let input_dir = [
       (KeyCode::KeyW, forward),
       (KeyCode::ArrowUp, forward),
       (KeyCode::KeyS, -forward),
@@ -494,95 +1104,46 @@ fn player_movement(
       (KeyCode::ArrowRight, right)
     ]
     .into_iter()
-    .filter_map(|(key, v)| keyboard.pressed(key).then_some(v)) // keep the vector only if the key is down
-    .sum::<Vec3>() // Vec3 implements `Sum`
-    .normalize_or_zero(); // guard against “no input”
+    .filter_map(|(k, v)| keyboard.pressed(k).then_some(v))
+    .sum::<Vec3>()
+    .normalize_or_zero();
 
-    // Single force calculation per frame
-    let max_speed = 8.0; // Reduced from 12.0
-    let max_force = 200.0; // Reduced from 400.0  
-    let friction_force = 150.0; // Reduced from 300.0
+    // Tunables
+    let max_speed = 8.0;
+    let max_force = 200.0;
+    let friction_force = 150.0;
 
-    // Current horizontal velocity
-    let current_horizontal = Vec3::new(velocity.x, 0.0, velocity.z);
-    let current_speed = current_horizontal.length();
+    // Current planar velocity
+    let horiz_vel = Vec3::new(vel.x, 0.0, vel.z);
+    let speed = horiz_vel.length();
 
-    // Debug control loss - log when velocity gets too high or when no input but still moving
-    // static mut DEBUG_COUNTER: u32 = 0;
-    // unsafe {
-    //   DEBUG_COUNTER += 1;
-    //   let has_input = direction.length() > 0.1;
-
-    //   if DEBUG_COUNTER % 60 == 0
-    //     && (current_speed > 6.0 || (!has_input && current_speed > 2.0))
-    //   {
-    //     println!(
-    //       "Control issue - pos: {:.2?}, grounded: {}, velocity: {:.2?}, input: {}, speed: {:.2}",
-    //       player_transform.translation, is_grounded, velocity.0, has_input, current_speed
-    //     );
-    //     if let Some(hit) = raycast_result {
-    //       println!("  Ground hit at distance: {:.3}", hit.distance);
-    //     }
-    //   }
-    // }
-
-    // Calculate single force for this frame
-    let final_force = if is_grounded {
-      if direction.length() > 0.1 {
-        // Moving: combine input force and friction
-        let speed_ratio = (current_speed / max_speed).min(1.0);
-        let input_force = direction * max_force * (1.0 - speed_ratio); // Scales to zero at max speed
-
-        // Custom friction: oppose current movement
-        let friction = if current_speed > 0.1 {
-          -current_horizontal.normalize() * friction_force * speed_ratio
-        } else {
-          Vec3::ZERO
-        };
-
-        input_force + friction
+    // Choose a single force for this frame
+    let force = if is_grounded {
+      if input_dir.length() > 0.1 {
+        // Driving + friction while a key is held
+        let speed_ratio = (speed / max_speed).min(1.0);
+        // Optional extra friction (commented out in original)
+        /* let friction    = if speed > 0.1 {
+            -horiz_vel.normalize() * friction_force * speed_ratio
+        } else { Vec3::ZERO }; */
+        input_dir * max_force * (1.0 - speed_ratio)
+      } else if speed > 0.1 {
+        // No input: braking friction
+        -horiz_vel.normalize() * friction_force
       } else {
-        // Not moving: only friction to stop
-        if current_speed > 0.1 {
-          -current_horizontal.normalize() * friction_force
-        } else {
-          Vec3::ZERO
-        }
+        Vec3::ZERO
       }
     } else {
-      // In air: no forces applied
+      // Airborne: no ground forces
       Vec3::ZERO
     };
 
-    // Apply the calculated force (forces were cleared at frame start)
-    external_force.apply_force(final_force);
-  }
-}
+    ext_force.apply_force(force);
 
-fn player_jump(
-  mut player_query: Query<(&mut LinearVelocity, Entity), With<Player>>,
-  keyboard: Res<ButtonInput<KeyCode>>,
-  spatial_query: SpatialQuery,
-  player_transform_query: Query<&Transform, With<Player>>
-) {
-  if keyboard.just_pressed(KeyCode::Space)
-    && let Ok((mut velocity, player_entity)) = player_query.single_mut()
-    && let Ok(transform) = player_transform_query.single()
-  {
-    // Cast ray from slightly above the player's feet to detect ground
-    let ray_origin = transform.translation + Vec3::new(0.0, -0.8, 0.0);
-    let ray_direction = Dir3::NEG_Y;
-    let max_distance = 0.3; // Shorter distance for more precise ground detection
+    /* ---------- 2. jump ---------- */
 
-    // Exclude the player entity from the raycast
-    let filter = SpatialQueryFilter::default().with_excluded_entities([player_entity]);
-
-    if let Some(_hit) =
-      spatial_query.cast_ray(ray_origin, ray_direction, max_distance, true, &filter)
-      && velocity.y.abs() < 2.0
-    {
-      // Direct velocity change for instant jump
-      velocity.y = 12.0;
+    if is_grounded && keyboard.just_pressed(KeyCode::Space) {
+      vel.y = 12.0; // instant upward kick
     }
   }
 }
@@ -686,31 +1247,39 @@ fn pizza_delivery_system(
   mut commands: Commands,
   mut stats: ResMut<PlayerStats>
 ) {
+  let mut delivered_pizzas = Vec::new();
+  
   for (pizza_entity, pizza_transform) in pizza_query.iter() {
+    // Check distance to NPCs that want pizza and aren't satisfied
     for (_npc_entity, npc_transform, mut npc) in npc_query.iter_mut() {
-      // Check if NPC wants pizza and pizza is close enough
-      if npc.wants_pizza {
+      if npc.wants_pizza && !npc.satisfied {
         let distance = pizza_transform.translation.distance(npc_transform.translation);
         if distance < 3.0 {
-          // Increased delivery range
+          println!("Pizza delivered to NPC! They are now satisfied.");
+          
           // Mark NPC as satisfied
+          npc.satisfied = true;
           npc.wants_pizza = false;
-
-          // Remove pizza and its sprite
-          for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
-            if sprite_follower.target_entity == pizza_entity {
-              commands.entity(follower_entity).despawn();
-            }
-          }
-          commands.entity(pizza_entity).despawn();
-
+          
+          delivered_pizzas.push(pizza_entity);
+          
           // Increment delivery counter
           stats.pizzas_delivered += 1;
-
-          break; // Exit NPC loop for this pizza
+          
+          break; // Move to next pizza
         }
       }
     }
+  }
+  
+  // Remove delivered pizzas and their sprites in batch
+  for pizza_entity in delivered_pizzas {
+    for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
+      if sprite_follower.target_entity == pizza_entity {
+        commands.entity(follower_entity).despawn();
+      }
+    }
+    commands.entity(pizza_entity).despawn();
   }
 }
 
@@ -720,20 +1289,26 @@ fn pizza_timer_system(
   mut commands: Commands,
   time: Res<Time>
 ) {
+  let mut expired_pizzas = Vec::new();
+  
   for (entity, mut pizza_timer) in pizza_query.iter_mut() {
     pizza_timer.timer.tick(time.delta());
 
-    // Despawn pizza after 3 seconds if not delivered
+    // Despawn pizza after timer expires if not delivered
     if pizza_timer.timer.finished() {
-      // Find and despawn associated sprite followers
-      for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
-        if sprite_follower.target_entity == entity {
-          commands.entity(follower_entity).despawn();
-        }
-      }
-
-      commands.entity(entity).despawn();
+      expired_pizzas.push(entity);
     }
+  }
+  
+  // Remove expired pizzas
+  for entity in expired_pizzas {
+    // Find and despawn associated sprite followers
+    for (follower_entity, sprite_follower) in sprite_follower_query.iter() {
+      if sprite_follower.target_entity == entity {
+        commands.entity(follower_entity).despawn();
+      }
+    }
+    commands.entity(entity).despawn();
   }
 }
 
